@@ -12,6 +12,7 @@ ingestion path does no extra allocation beyond what it needs.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 JSON = dict[str, Any]
@@ -74,8 +75,32 @@ def event_type(raw: JSON) -> str:
     return t
 
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def normalise_ts(v: Any) -> str | None:
+    """Canonical ISO-8601 in IST, second precision: '2027-01-04T10:15:00+05:30'.
+
+    All stored timestamps share this form, so string comparison is time order
+    and ``substr(ts, 1, 13)`` is the IST hour bucket. Naive timestamps are
+    taken as IST (the simulator's clock). Unparseable values are kept as-is.
+    """
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return datetime.fromtimestamp(v, IST).isoformat(timespec="seconds")
+    s = str(v)
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return s
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=IST)
+    return dt.astimezone(IST).isoformat(timespec="seconds")
+
+
 def event_ts(raw: JSON) -> str | None:
-    return _get(raw, "ts", "timestamp", "time", "sim_time")
+    return normalise_ts(_get(raw, "ts", "timestamp", "time", "sim_time"))
 
 
 # --------------------------------------------------------------- projections

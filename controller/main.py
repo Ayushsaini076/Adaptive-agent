@@ -1,8 +1,10 @@
 """Controller entry point and main loop.
 
-Milestone 2 scope: bootstrap from history, then advance time and ingest every
-returned chunk until the scenario finishes. No decisions are made yet, so a
-full run is a "no-change baseline" run of the scenario.
+Current scope (Milestones 1-3): discover workflows and snapshot their configs,
+bootstrap from history and snapshot historical baselines, then advance time
+and ingest every returned chunk until the scenario finishes, refreshing config
+snapshots whenever a ``config_changed`` event arrives. No decisions are made
+yet, so a full run is a "no-change baseline" run of the scenario.
 
 Restart safety: on startup we ``catch_up`` both chunk kinds from the
 committed cursor. If the previous process died after ``/sim/advance`` returned
@@ -23,7 +25,9 @@ from dataclasses import dataclass
 from controller.client import ScenarioFinished, SimulatorClient, SimulatorError
 from controller.database import connect, set_state, transaction
 from controller.ingestion import Ingester, IngestStats
+from controller.metrics import snapshot_baselines
 from controller.settings import Settings
+from controller.workflows import WorkflowRegistry
 
 log = logging.getLogger("controller")
 
@@ -72,6 +76,7 @@ class RunSummary:
     history: IngestStats | None = None
     live: IngestStats | None = None
     wall_seconds: float = 0.0
+    workflows: list[str] | None = None
 
     def as_dict(self) -> dict:
         def s(st: IngestStats | None) -> dict | None:
@@ -80,9 +85,38 @@ class RunSummary:
             return {"chunks": st.chunks, "events": st.events, "inserted": st.inserted,
                     "rejected": st.rejected, "ingest_seconds": round(st.seconds, 3),
                     "events_per_sec": round(st.events_per_sec)}
-        return {"advances": self.advances, "finished": self.finished,
+        return {"workflows": self.workflows, "advances": self.advances, "finished": self.finished,
                 "sim_time": self.sim_time, "history": s(self.history),
                 "live": s(self.live), "wall_seconds": round(self.wall_seconds, 3)}
+
+
+def history_window_end(conn: sqlite3.Connection) -> str | None:
+    """Exclusive end (next hour) of the ingested history, or None if no history."""
+    row = conn.execute(
+        "SELECT MAX(e.ts) FROM events e JOIN event_chunks ch ON ch.chunk_number = "
+        "e.chunk_number WHERE ch.kind = 'history'").fetchone()
+    if not row or not row[0]:
+        return None
+    from datetime import datetime, timedelta
+    last = datetime.fromisoformat(row[0]).replace(minute=0, second=0)
+    return (last + timedelta(hours=1)).isoformat(timespec="seconds")
+
+
+def snapshot_history_baselines(conn: sqlite3.Connection, workflow_ids: list[str]) -> None:
+    """Persist pre-D0 baselines once per workflow. Restarts don't recompute them,
+    so live data never leaks into the 'history' label."""
+    end = history_window_end(conn)
+    if end is None:
+        return
+    for wf in workflow_ids:
+        if conn.execute("SELECT 1 FROM baselines WHERE workflow_id=? AND label='history'",
+                        (wf,)).fetchone():
+            continue
+        with transaction(conn):
+            bl = snapshot_baselines(conn, wf, "history", end=end)
+        wide = {b.kpi: b.rate.as_dict() for b in bl if b.cohort_id == "*"}
+        log.info("history baseline %s (calls before %s): pickup %s, engagement %s",
+                 wf, end, wide.get("pickup"), wide.get("engagement"))
 
 
 def _record_time(conn: sqlite3.Connection, sim_time: str | None, finished: bool) -> None:
@@ -101,9 +135,14 @@ def run(settings: Settings, client: SimulatorClient, conn: sqlite3.Connection,
     state = client.state()
     log.info("simulator state: %s", state)
 
+    registry = WorkflowRegistry(conn, client)
+    summary.workflows = registry.sync_all()
+    log.info("discovered %d workflows: %s", len(summary.workflows), summary.workflows)
+
     summary.history = ingester.catch_up("history")
     log.info("history bootstrap: %d chunks, %d events (%d new)",
              summary.history.chunks, summary.history.events, summary.history.inserted)
+    snapshot_history_baselines(conn, summary.workflows)
 
     # Recover chunks from an advance whose ingestion didn't commit before a crash.
     live = ingester.catch_up("events")
@@ -128,6 +167,9 @@ def run(settings: Settings, client: SimulatorClient, conn: sqlite3.Connection,
         summary.sim_time = result.sim_time
         for r in ingester.ingest_many(result.new_chunks, "events").results:
             live.add(r)
+        changed = registry.refresh_changed()
+        if changed:
+            log.info("config changed for %s; snapshots refreshed", changed)
         # Time is recorded only after its chunks are committed.
         _record_time(conn, result.sim_time, result.finished)
         log.info("advanced to %s: %d chunks, cumulative live events %d",

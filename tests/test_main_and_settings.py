@@ -87,3 +87,20 @@ def test_restart_after_finish_does_not_advance(tmp_path):
     s = run(_settings(tmp_path), sim.client(), conn)
     assert s.finished and s.advances == 0
     assert all(r.url.path != "/sim/advance" for r in sim.requests[n:])
+
+
+def test_run_snapshots_configs_and_history_baselines_once(tmp_path):
+    sim = sample_simulator()
+    conn = connect(tmp_path / "c.db")
+    s = run(_settings(tmp_path), sim.client(), conn, bootstrap_only=True)
+    assert s.workflows == ["wf_a", "wf_b"]
+    assert conn.execute("SELECT COUNT(*) FROM workflow_config_snapshots").fetchone()[0] == 2
+    hist = conn.execute("SELECT den, window_end FROM baselines WHERE workflow_id='wf_a' "
+                        "AND label='history' AND kpi='pickup' AND cohort_id='*'").fetchone()
+    assert hist[0] == 5                                    # 5 history calls
+    assert hist[1] == "2027-01-04T11:00:00+05:30"          # hour after last history event
+
+    run(_settings(tmp_path), sim.client(), conn)           # full run incl. live data
+    again = conn.execute("SELECT den FROM baselines WHERE workflow_id='wf_a' "
+                         "AND label='history' AND kpi='pickup' AND cohort_id='*'").fetchone()
+    assert again[0] == 5                                   # live data never leaks in

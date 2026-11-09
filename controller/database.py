@@ -10,13 +10,91 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-# Each entry migrates user_version i -> i+1. Never edit a shipped migration;
-# append a new one.
-MIGRATIONS: list[str] = [
+# Each entry migrates user_version i -> i+1: either a SQL script or a function
+# taking the connection (already inside the migration's transaction). Never
+# edit a shipped migration; append a new one.
+Migration = str | Callable[[sqlite3.Connection], None]
+
+_M2_SQL = """
+    CREATE INDEX idx_events_chunk ON events(chunk_number);
+
+    CREATE TABLE workflows (
+        workflow_id TEXT PRIMARY KEY,
+        tenant_id   TEXT,
+        metadata    TEXT NOT NULL,        -- latest GET /workflows/{id}, incl. objective/policy
+        updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+
+    -- Immutable: one row per (workflow, version); the first copy wins.
+    CREATE TABLE workflow_config_snapshots (
+        workflow_id  TEXT NOT NULL,
+        version      INTEGER NOT NULL,
+        actor        TEXT,
+        effective_ts TEXT,
+        source       TEXT NOT NULL,       -- api_current | api_history
+        config       TEXT NOT NULL,
+        fetched_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        PRIMARY KEY (workflow_id, version)
+    );
+
+    CREATE TABLE cohort_snapshots (
+        workflow_id TEXT NOT NULL,
+        version     INTEGER NOT NULL,
+        cohort_id   TEXT NOT NULL,
+        position    INTEGER NOT NULL,
+        where_json  TEXT NOT NULL,
+        PRIMARY KEY (workflow_id, version, cohort_id)
+    );
+
+    -- Hourly call counts keyed by the call's OWN recorded attribution.
+    -- Unknown values are '' / -1 so the key is never NULL.
+    CREATE TABLE metric_aggregates (
+        workflow_id     TEXT NOT NULL,
+        hour            TEXT NOT NULL,    -- 'YYYY-MM-DDTHH' in IST
+        cohort_id       TEXT NOT NULL,
+        config_version  INTEGER NOT NULL,
+        welcome_message TEXT NOT NULL,
+        voice           TEXT NOT NULL,
+        caller_id       TEXT NOT NULL,
+        prompt_version  TEXT NOT NULL,
+        dials           INTEGER NOT NULL,
+        connected       INTEGER NOT NULL,
+        engaged         INTEGER NOT NULL,
+        qa_n            INTEGER NOT NULL,
+        hallucinations  INTEGER NOT NULL,
+        PRIMARY KEY (workflow_id, hour, cohort_id, config_version, welcome_message,
+                     voice, caller_id, prompt_version)
+    );
+    CREATE INDEX idx_agg_wf_cohort ON metric_aggregates(workflow_id, cohort_id, hour);
+
+    CREATE TABLE baselines (
+        workflow_id  TEXT NOT NULL,
+        label        TEXT NOT NULL,       -- e.g. 'history'
+        kpi          TEXT NOT NULL,
+        cohort_id    TEXT NOT NULL,
+        population   TEXT NOT NULL,       -- cohort used; '*' when pooled
+        num          INTEGER NOT NULL,
+        den          INTEGER NOT NULL,
+        window_start TEXT,
+        window_end   TEXT,
+        computed_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        PRIMARY KEY (workflow_id, label, kpi, cohort_id)
+    );
+"""
+
+
+def _m2_cohorts_and_metrics(conn: sqlite3.Connection) -> None:
+    for stmt in _split_sql(_M2_SQL):
+        conn.execute(stmt)
+    from controller.metrics import rebuild_aggregates  # backfill from existing calls
+    rebuild_aggregates(conn)
+
+
+MIGRATIONS: list[Migration] = [
     # 1: ingestion foundation
     """
     CREATE TABLE controller_state (
@@ -135,6 +213,8 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX idx_approval_decisions_id ON approval_decisions(approval_id);
     """,
+    # 2: workflows, config/cohort snapshots, aggregates, baselines
+    _m2_cohorts_and_metrics,
 ]
 
 
@@ -161,9 +241,13 @@ def schema_version(conn: sqlite3.Connection) -> int:
 def migrate(conn: sqlite3.Connection) -> None:
     current = schema_version(conn)
     for version in range(current, len(MIGRATIONS)):
+        step = MIGRATIONS[version]
         with transaction(conn):
-            for stmt in _split_sql(MIGRATIONS[version]):
-                conn.execute(stmt)
+            if callable(step):
+                step(conn)
+            else:
+                for stmt in _split_sql(step):
+                    conn.execute(stmt)
             conn.execute(f"PRAGMA user_version = {version + 1}")
 
 

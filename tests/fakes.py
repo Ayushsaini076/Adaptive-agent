@@ -52,7 +52,8 @@ def call_event(eid: int, lead: str, campaign: str, wf: str = "wf_a", *,
             "variant": {"welcome_message": "w1", "voice": "v1", "caller_id": "c1",
                         "prompt_version": "p1"},
             "connected": connected, "engaged": engaged and connected,
-            "disposition": "concluded_interested" if engaged else "no_answer",
+            "disposition": ("concluded_interested" if engaged and connected
+                            else "short_hangup" if connected else "no_answer"),
             "duration_s": 42.0, "turns": 6,
             "qa": {"hallucination_flag": False, "flow_adherence": 0.9} if connected else None}
 
@@ -84,6 +85,7 @@ class FakeSimulator:
     # chunk_number -> number of lines to serve before the stream breaks (one-shot)
     broken_chunks: dict[int, int] = field(default_factory=dict)
     next_event_id: int = 1000
+    config_history: dict[str, list[dict]] = field(default_factory=dict)
 
     @property
     def finished(self) -> bool:
@@ -131,7 +133,7 @@ class FakeSimulator:
             if parts[2:] == ["config"]:
                 return httpx.Response(200, json=self.configs[wf])
             if parts[2:] == ["config", "history"]:
-                return httpx.Response(200, json=[self.configs[wf]])
+                return httpx.Response(200, json=self.config_history.get(wf, [self.configs[wf]]))
         if (m, path) == ("GET", "/events/chunks"):
             kind = request.url.params["kind"]
             after = int(request.url.params.get("after", -1))
@@ -151,6 +153,18 @@ class FakeSimulator:
                                   headers={"content-type": "application/x-ndjson"})
         return httpx.Response(404, json={"detail": f"no route {m} {path}"})
 
+    def supervisor_edit(self, wf: str, **changes: Any) -> dict:
+        """Change a config the way a client supervisor would; returns the event."""
+        old = self.configs[wf]
+        new = {**old, **changes, "version": old["version"] + 1}
+        self.config_history.setdefault(wf, [old]).append(new)
+        self.configs[wf] = new
+        eid = self.next_event_id
+        self.next_event_id += 1
+        return {"event_id": eid, "type": "config_changed", "ts": "2027-01-04T12:00:00+05:30",
+                "workflow_id": wf, "new_version": new["version"], "actor": "supervisor",
+                "changed_dims": sorted(changes)}
+
     def client(self, **kwargs: Any) -> SimulatorClient:
         kwargs.setdefault("backoff_s", 0)
         return SimulatorClient("http://sim.test", transport=httpx.MockTransport(self.handler),
@@ -166,8 +180,10 @@ def sample_simulator() -> FakeSimulator:
             "wf_b": {"tenant_id": "t2", "objective": {"primary": "engagement"},
                      "mid_flight": "next_campaign_only"},
         },
-        configs={"wf_a": {"version": 3, "prompt_version": "p1"},
-                 "wf_b": {"version": 1, "prompt_version": "p9"}},
+        configs={"wf_a": {"version": 3, "prompt_version": "p1",
+                          "cohorts": [{"cohort_id": "hi_t2",
+                                       "where": {"lang": ["hi"], "city_tier": [2]}}]},
+                 "wf_b": {"version": 1, "prompt_version": "p9", "cohorts": []}},
         history_chunks={1: chunk_of_activity(1, "hist1"),
                         2: chunk_of_activity(100, "hist2", n_leads=3)},
     )

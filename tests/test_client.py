@@ -40,7 +40,7 @@ def test_list_workflows_and_details(sim):
         assert ids == ["wf_a", "wf_b"]
         assert c.get_workflow("wf_b")["mid_flight"] == "next_campaign_only"
         assert c.get_config("wf_a")["version"] == 3
-        assert c.get_config_history("wf_a") == [{"version": 3, "prompt_version": "p1"}]
+        assert c.get_config_history("wf_a") == [sim.configs["wf_a"]]
 
 
 def test_list_workflows_accepts_wrapped_and_bare_ids():

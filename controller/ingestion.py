@@ -11,6 +11,8 @@ Guarantees
   chunks never double-counts.
 * Events are streamed and flushed in batches of ``batch_size`` rows, so peak
   memory is bounded by the batch size, not the chunk size.
+* ``metric_aggregates`` are folded in from the chunk's newly inserted calls
+  in the same transaction, so they can never disagree with ``calls``.
 * Chunks are processed strictly in ascending order and ingestion stops at the
   first failure, so the committed set never has gaps below the cursor.
 """
@@ -25,6 +27,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from controller import events as ev
+from controller.metrics import update_aggregates_for_chunk
 from controller.client import SimulatorClient
 from controller.database import set_state, transaction
 
@@ -173,6 +176,7 @@ class Ingester:
                     buffered = 0
 
             res.inserted += self._flush(buffers)
+            update_aggregates_for_chunk(self.conn, chunk_number)
             self.conn.execute(
                 "INSERT INTO event_chunks(chunk_number, kind, event_count, inserted_count, "
                 "rejected_count, first_event_id, last_event_id) VALUES (?,?,?,?,?,?,?)",
