@@ -152,24 +152,28 @@ def guardrail_unit(guardrail_kpi: Kpi, dim: str) -> str:
 
 
 def _carryover_sql(dim_expr: str, extra: str) -> str:
+    """Per arm: (people observed, people whose next dial connected).
+
+    One ordered pass: LEAD() reads each person's next call. Parameters, in
+    order: workflow_id, end, *version filter values, cohort_id, start.
+
+    Candidate "next calls" are any call of the same person in the workflow
+    before ``end`` (any cohort, same version filter); the EXPOSURE call is the
+    person's first connected call in [start, end) in the cohort. One row per
+    person (rn = 1), so repeat calls are never independent observations.
+    (Replaces a correlated subquery that could not use an index: O(P x N).)
+    """
     return f"""
-        WITH fc AS (
-            SELECT p, eid, arm FROM (
-                SELECT COALESCE(person_id, lead_id) AS p, event_id AS eid, {dim_expr} AS arm,
-                       ROW_NUMBER() OVER (PARTITION BY COALESCE(person_id, lead_id)
-                                          ORDER BY event_id) AS rn
-                FROM calls
-                WHERE workflow_id = ? AND cohort_id = ? AND ts >= ? AND ts < ?
-                  AND connected = 1 {extra})
-            WHERE rn = 1),
-        nxt AS (
-            SELECT fc.arm,
-                   (SELECT c.connected FROM calls c
-                    WHERE c.workflow_id = ? AND COALESCE(c.person_id, c.lead_id) = fc.p
-                      AND c.event_id > fc.eid AND c.ts < ? {extra.replace("config_version", "c.config_version")}
-                    ORDER BY c.event_id LIMIT 1) AS y
-            FROM fc)
-        SELECT arm, COUNT(y), SUM(y) FROM nxt WHERE y IS NOT NULL GROUP BY arm"""
+        WITH seq AS (
+            SELECT COALESCE(person_id, lead_id) AS p, event_id, ts, cohort_id, connected,
+                   {dim_expr} AS arm,
+                   LEAD(connected) OVER (PARTITION BY COALESCE(person_id, lead_id)
+                                         ORDER BY event_id) AS y
+            FROM calls WHERE workflow_id = ? AND ts < ? {extra}),
+        fc AS (
+            SELECT arm, y, ROW_NUMBER() OVER (PARTITION BY p ORDER BY event_id) AS rn
+            FROM seq WHERE cohort_id = ? AND ts >= ? AND connected = 1)
+        SELECT arm, COUNT(y), SUM(y) FROM fc WHERE rn = 1 AND y IS NOT NULL GROUP BY arm"""
 
 
 def carryover_exposures(conn: sqlite3.Connection, workflow_id: str, cohort_id: str, dim: str,
@@ -183,15 +187,14 @@ def carryover_exposures(conn: sqlite3.Connection, workflow_id: str, cohort_id: s
     qs = ",".join("?" * len(versions))
     end = end or "9999"
     sql = _carryover_sql(dim, f"AND config_version IN ({qs})")
-    rows = conn.execute(sql, (workflow_id, cohort_id, start, end, *versions,
-                              workflow_id, end, *versions)).fetchall()
+    rows = conn.execute(sql, (workflow_id, end, *versions, cohort_id, start)).fetchall()
     return {arm: Rate(int(y or 0), int(n)) for arm, n, y in rows if arm is not None}
 
 
 def carryover_baseline(conn: sqlite3.Connection, workflow_id: str, cohort_id: str,
                        end: str) -> Rate:
     rows = conn.execute(_carryover_sql("'all'", ""),
-                        (workflow_id, cohort_id, "0000", end, workflow_id, end)).fetchall()
+                        (workflow_id, end, cohort_id, "0000")).fetchall()
     return Rate(int(rows[0][2] or 0), int(rows[0][1])) if rows else Rate(0, 0)
 
 
@@ -208,7 +211,7 @@ def carryover_curve(conn: sqlite3.Connection, workflow_id: str, cohort_id: str,
     for d in range(1, days + 1):
         upto = min(day0 + timedelta(days=d), _dt(end)).isoformat(timespec="seconds")
         rows = conn.execute(_carryover_sql("'all'", ""),
-                            (workflow_id, cohort_id, first, upto, workflow_id, upto)).fetchall()
+                            (workflow_id, upto, cohort_id, first)).fetchall()
         curve.append(int(rows[0][1]) if rows else 0)
     return curve
 
@@ -437,6 +440,7 @@ def plan(conn: sqlite3.Connection, registry: WorkflowRegistry, workflow_id: str,
             continue
         volumes.append((units_within(curve, max_days, new_only=new_only), cohort, curve))
     volumes.sort(key=lambda v: (-v[0], v[1]))
+    sizing_memo: dict[tuple[str, str], tuple] = {}
 
     for dim in policy.dimensions:
         if (kpi == "pickup" and dim in POST_CONNECT_DIMS
@@ -465,8 +469,10 @@ def plan(conn: sqlite3.Connection, registry: WorkflowRegistry, workflow_id: str,
                 reasons.append(f"{dim}/{cohort}: no usable first-exposure {kpi} baseline")
                 continue
             g_unit = guardrail_unit(guard, dim)
-            n_guard, g_base, g_curve = _guardrail_sizing(conn, wf, cohort, hist_end, policy,
-                                                         g_unit)
+            key = (cohort, g_unit)             # same for every dimension with this unit
+            if key not in sizing_memo:
+                sizing_memo[key] = _guardrail_sizing(conn, wf, cohort, hist_end, policy, g_unit)
+            n_guard, g_base, g_curve = sizing_memo[key]
             if n_guard < 0:
                 unit_txt = (" (unit: next dial after a connected exposure)"
                             if g_unit == CARRYOVER else "")
