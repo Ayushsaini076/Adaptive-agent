@@ -63,21 +63,31 @@ from controller.workflows import Kpi, Workflow, WorkflowRegistry
 
 log = logging.getLogger(__name__)
 
+POST_CONNECT_DIMS = ("welcome_message", "voice")
 PLANNED, RUNNING, DECIDED, ABORTED, CANCELLED = (
     "planned", "running", "decided", "aborted", "cancelled")
+PROMOTED, ROLLED_BACK = "promoted", "rolled_back"
 ACTIVE = (PLANNED, RUNNING)
-TRANSITIONS = {PLANNED: {RUNNING, CANCELLED}, RUNNING: {DECIDED, ABORTED}}
+TRANSITIONS = {PLANNED: {RUNNING, CANCELLED}, RUNNING: {DECIDED, ABORTED},
+               DECIDED: {PROMOTED}, PROMOTED: {ROLLED_BACK}}
 
 
 @dataclass(frozen=True)
 class ExperimentPolicy:
     dimensions: tuple[str, ...] = ("welcome_message", "voice")
+    # welcome_message / voice are heard only AFTER a call connects, so they have
+    # no causal path to first-dial pickup. Off by default for pickup-primary.
+    post_connect_dims_for_pickup: bool = False
     alpha: float = 0.05
     power: float = 0.80
-    mde: float = 0.03                    # absolute uplift the design is powered to detect
+    mde: float = 0.03                    # TARGET uplift to power for, when the window allows
+    max_acceptable_mde: float = 0.05     # largest MDE worth running (business decision)
     min_practical_uplift: float = 0.01   # smallest uplift worth promoting
     max_candidates: int = 2
-    max_duration_hours: float = 72.0     # deadline after go-live
+    max_duration_hours: float | None = None  # optional hard cap on run time after go-live
+    fallback_horizon_hours: float = 72.0     # used only when the scenario end is unknown
+    approval_buffer_hours: float = 24.0      # time to get the design approved and live
+    post_decision_hours: float = 48.0        # promotion approval + after-change measurement
     next_campaign_ramp_hours: float = 24.0
     replan_interval_hours: float = 6.0
     promotion_holdout: float = 0.10      # control share kept after promotion
@@ -130,19 +140,131 @@ def first_exposures(conn: sqlite3.Connection, workflow_id: str, cohort_id: str, 
     return {arm: Rate(int(y or 0), int(n)) for arm, n, y in rows}
 
 
-def daily_units(conn: sqlite3.Connection, workflow_id: str, cohort_id: str, kpi: Kpi,
-                end: str) -> tuple[float, int]:
-    """Mean distinct persons per day (the test's unit) in history before ``end``.
-    Returns (units_per_day, total_units)."""
+def unit_curve(conn: sqlite3.Connection, workflow_id: str, cohort_id: str, kpi: Kpi,
+               end: str) -> list[int]:
+    """Cumulative distinct test units seen in the first 1, 2, ... D days of history.
+
+    This is what an experiment window of d days actually yields: a person dialled
+    on several days counts ONCE (one observation per person), unlike a per-day
+    average, which counts re-dialled people every day and overstates traffic.
+    Units: any dial for pickup, connected dials for engagement.
+    """
     only_connected = "AND connected = 1" if kpi == "engagement" else ""
-    rows = conn.execute(
-        f"SELECT substr(ts, 1, 10) d, COUNT(DISTINCT COALESCE(person_id, lead_id)) "
-        f"FROM calls WHERE workflow_id = ? AND cohort_id = ? AND ts < ? {only_connected} "
-        f"GROUP BY d", (workflow_id, cohort_id, end)).fetchall()
-    if not rows:
-        return 0.0, 0
-    total = sum(r[1] for r in rows)
-    return total / len(rows), total
+    first = conn.execute(
+        f"SELECT MIN(ts) FROM calls WHERE workflow_id = ? AND cohort_id = ? AND ts < ? "
+        f"{only_connected}", (workflow_id, cohort_id, end)).fetchone()[0]
+    if first is None:
+        return []
+    day0 = _dt(first).replace(hour=0, minute=0, second=0, microsecond=0)
+    days = math.ceil((_dt(end) - day0).total_seconds() / 86400)
+    curve = []
+    for d in range(1, days + 1):
+        upto = min(day0 + timedelta(days=d), _dt(end)).isoformat(timespec="seconds")
+        curve.append(conn.execute(
+            f"SELECT COUNT(DISTINCT COALESCE(person_id, lead_id)) FROM calls "
+            f"WHERE workflow_id = ? AND cohort_id = ? AND ts >= ? AND ts < ? {only_connected}",
+            (workflow_id, cohort_id, first, upto)).fetchone()[0])
+    return curve
+
+
+def new_units_per_day(curve: list[int]) -> int:
+    """Steady-state NEW units per day: the last history day's increment."""
+    if not curve:
+        return 0
+    return curve[-1] - curve[-2] if len(curve) >= 2 else curve[-1]
+
+
+def units_within(curve: list[int], days: int, *, new_only: bool = False) -> int:
+    """Units an experiment of ``days`` whole days collects (pessimistic).
+
+    Beyond the history length, extends with new units per day. ``new_only``
+    (next_campaign_only workflows) counts only people arriving after go-live.
+    """
+    if days <= 0 or not curve:
+        return 0
+    per_day = new_units_per_day(curve)
+    if new_only:
+        return days * per_day
+    if days <= len(curve):
+        return curve[days - 1]
+    return curve[-1] + (days - len(curve)) * per_day
+
+
+def days_to_reach(curve: list[int], units: int, max_days: int, *,
+                  new_only: bool = False) -> int | None:
+    for d in range(1, max_days + 1):
+        if units_within(curve, d, new_only=new_only) >= units:
+            return d
+    return None
+
+
+def first_exposure_baseline(conn: sqlite3.Connection, workflow_id: str, cohort_id: str,
+                            kpi: Kpi, end: str) -> Rate:
+    """History rate on the SAME unit the test uses: each person's first dial
+    (pickup) or first connected dial (engagement)."""
+    outcome = "connected" if kpi == "pickup" else "engaged"
+    only_connected = "AND connected = 1" if kpi == "engagement" else ""
+    n, y = conn.execute(
+        f"WITH f AS (SELECT {outcome} AS y, ROW_NUMBER() OVER ("
+        f"PARTITION BY COALESCE(person_id, lead_id) ORDER BY event_id) rn FROM calls "
+        f"WHERE workflow_id = ? AND cohort_id = ? AND ts < ? {only_connected}) "
+        f"SELECT COUNT(*), SUM(y) FROM f WHERE rn = 1",
+        (workflow_id, cohort_id, end)).fetchone()
+    return Rate(int(y or 0), int(n or 0))
+
+
+def planning_horizon(conn: sqlite3.Connection, policy: ExperimentPolicy,
+                     ramp_hours: float) -> tuple[float, str]:
+    """Hours an experiment may run after go-live, and where that number came from.
+
+    = time left in the scenario - approval buffer - post-decision time - ramp,
+    so a decided winner can still be promoted and measured before the end.
+    """
+    end, now = get_state(conn, "end_minute"), get_state(conn, "sim_minute")
+    if end not in (None, "None") and now not in (None, "None"):
+        hours = ((int(end) - int(now)) / 60 - policy.approval_buffer_hours
+                 - policy.post_decision_hours - ramp_hours)
+        source = (f"scenario: {(int(end) - int(now)) / 60:.0f}h left - "
+                  f"{policy.approval_buffer_hours:.0f}h approval - "
+                  f"{policy.post_decision_hours:.0f}h post-decision - {ramp_hours:.0f}h ramp")
+    else:
+        hours = policy.fallback_horizon_hours - ramp_hours
+        source = f"fallback {policy.fallback_horizon_hours:.0f}h - {ramp_hours:.0f}h ramp"
+    if policy.max_duration_hours is not None and hours > policy.max_duration_hours:
+        hours, source = policy.max_duration_hours, f"cap {policy.max_duration_hours:.0f}h"
+    return max(hours, 0.0), source
+
+
+def design_mde(p0: float, per_arm_available: int, policy: ExperimentPolicy,
+               k: int) -> float | None:
+    """Smallest MDE the window can power, preferring the target.
+
+    Returns the target if affordable, else the smallest affordable MDE up to
+    ``max_acceptable_mde`` (rounded UP to 0.1pp), else None. Alpha and power
+    never change: a larger MDE means more missed small effects, not more
+    false winners.
+    """
+    alpha = policy.alpha / k
+
+    def n(m: float) -> int:
+        return sample_size_per_arm(p0, m, alpha=alpha, power=policy.power)
+
+    try:
+        if n(policy.mde) <= per_arm_available:
+            return policy.mde
+        hi = max(policy.max_acceptable_mde, policy.mde)
+        if n(hi) > per_arm_available:
+            return None
+    except ValueError:
+        return None
+    lo = policy.mde
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        if n(mid) <= per_arm_available:
+            hi = mid
+        else:
+            lo = mid
+    return math.ceil(hi * 1000) / 1000
 
 
 # ----------------------------------------------------------------- planning
@@ -160,6 +282,7 @@ class Design:
     guardrail_kpi: Kpi
     n_per_arm: int
     n_guardrail_per_arm: int
+    horizon_hours: float
     base_version: int
     allocation: dict[str, float]
     proposed_config: dict
@@ -218,23 +341,34 @@ def plan(conn: sqlite3.Connection, registry: WorkflowRegistry, workflow_id: str,
     if cfg is None or version is None or cohort_set is None or hist_end is None:
         return None, ["no config snapshot or history baseline yet"]
     kpi, guard = wf.objective.primary, wf.objective.guardrail
-    ramp = policy.next_campaign_ramp_hours if wf.mid_flight == "next_campaign_only" else 0.0
+    new_only = wf.mid_flight == "next_campaign_only"
+    ramp = policy.next_campaign_ramp_hours if new_only else 0.0
+    horizon, horizon_src = planning_horizon(conn, policy, ramp)
+    max_days = int(horizon // 24)
+    if max_days < 1:
+        return None, [f"horizon {horizon:.0f}h ({horizon_src}) is under one day"]
 
     volumes = []
     for cohort in cohort_set.ids:
-        per_day, total = daily_units(conn, workflow_id, cohort, kpi, hist_end)
+        curve = unit_curve(conn, workflow_id, cohort, kpi, hist_end)
+        total = curve[-1] if curve else 0
         if total < policy.min_history_units:
             reasons.append(f"{cohort}: {total} historical units < {policy.min_history_units}")
             continue
-        volumes.append((per_day, total, cohort))
-    volumes.sort(key=lambda v: (-v[0], v[2]))
+        volumes.append((units_within(curve, max_days, new_only=new_only), cohort, curve))
+    volumes.sort(key=lambda v: (-v[0], v[1]))
 
     for dim in policy.dimensions:
+        if (kpi == "pickup" and dim in POST_CONNECT_DIMS
+                and not policy.post_connect_dims_for_pickup):
+            reasons.append(f"{dim}: acts only after a call connects, so it cannot move the "
+                           f"primary KPI (pickup); not tested")
+            continue
         opts = alloc.options(wf.meta, dim)
         if len(opts) < 2:
             reasons.append(f"{dim}: fewer than 2 options exposed")
             continue
-        for per_day, total, cohort in volumes:
+        for window_units, cohort, curve in volumes:
             current = alloc.distribution(cfg, cohort, dim)
             control = (max(sorted(current), key=current.get) if current
                        else _observed_control(conn, workflow_id, cohort, dim, hist_end))
@@ -246,28 +380,40 @@ def plan(conn: sqlite3.Connection, registry: WorkflowRegistry, workflow_id: str,
             if not untested:
                 reasons.append(f"{dim}/{cohort}: all options already tested")
                 continue
-            base = _baseline_rate(conn, workflow_id, cohort, kpi)
-            if base is None or not base.value or base.value >= 1:
-                reasons.append(f"{dim}/{cohort}: no usable {kpi} baseline")
+            base = first_exposure_baseline(conn, workflow_id, cohort, kpi, hist_end)
+            if not base.value or base.value >= 1:
+                reasons.append(f"{dim}/{cohort}: no usable first-exposure {kpi} baseline")
                 continue
-            n_guard, g_ratio, g_base = _guardrail_sizing(
-                conn, wf, cohort, hist_end, per_day, policy)
+            n_guard, g_base, g_curve = _guardrail_sizing(conn, wf, cohort, hist_end, policy)
+            g_window = units_within(g_curve, max_days, new_only=new_only) if n_guard else 0
             for k in range(min(policy.max_candidates, len(untested)), 0, -1):
-                try:
-                    n_primary = sample_size_per_arm(base.value, policy.mde,
-                                                    alpha=policy.alpha / k, power=policy.power)
-                except ValueError as e:
-                    reasons.append(f"{dim}/{cohort}: {e}")
-                    break
-                if n_guard and not g_ratio:
-                    reasons.append(f"{dim}/{cohort}: no guardrail volume in history")
-                    break
-                n = max(n_primary, math.ceil(n_guard / g_ratio)) if n_guard else n_primary
-                hours = n * (k + 1) / per_day * 24 + ramp
-                if hours > policy.max_duration_hours:
-                    reasons.append(f"{dim}/{cohort}/k={k}: needs {n}/arm, ~{hours:.0f}h "
-                                   f"> {policy.max_duration_hours:.0f}h")
+                arms_n = k + 1
+                per_arm = window_units // arms_n
+                g_per_arm = g_window // arms_n
+                where = (f"{dim}/{cohort}/k={k}: horizon {horizon:.0f}h ({horizon_src}), "
+                         f"window gives {per_arm} {kpi} units/arm")
+                if n_guard and g_per_arm < n_guard:
+                    reasons.append(f"{where}; guardrail {guard} non-inferiority needs "
+                                   f"{n_guard}/arm, window gives {g_per_arm}/arm")
                     continue
+                mde = design_mde(base.value, per_arm, policy, k)
+                if mde is None:
+                    try:
+                        need = sample_size_per_arm(
+                            base.value, max(policy.max_acceptable_mde, policy.mde),
+                            alpha=policy.alpha / k, power=policy.power)
+                    except ValueError:
+                        need = None
+                    reasons.append(f"{where}; even the max acceptable MDE "
+                                   f"{policy.max_acceptable_mde:.3f} needs {need}/arm")
+                    continue
+                n_primary = sample_size_per_arm(base.value, mde, alpha=policy.alpha / k,
+                                                power=policy.power)
+                d_primary = days_to_reach(curve, n_primary * arms_n, max_days,
+                                          new_only=new_only)
+                d_guard = (days_to_reach(g_curve, n_guard * arms_n, max_days,
+                                         new_only=new_only) if n_guard else 0)
+                expected_hours = max(d_primary or max_days, d_guard or 0) * 24 + ramp
                 cands = untested[:k]
                 arms = [control, *cands]
                 split = {a: 1 / len(arms) for a in arms}
@@ -275,20 +421,28 @@ def plan(conn: sqlite3.Connection, registry: WorkflowRegistry, workflow_id: str,
                 design = Design(
                     experiment_id=exp_id, workflow_id=workflow_id, cohort_id=cohort,
                     dimension=dim, control=control, candidates=cands, primary_kpi=kpi,
-                    guardrail_kpi=guard, n_per_arm=n, n_guardrail_per_arm=n_guard,
-                    base_version=version, allocation=split,
-                    proposed_config=alloc.with_distribution(cfg, cohort, dim, split),
+                    guardrail_kpi=guard, n_per_arm=n_primary, n_guardrail_per_arm=n_guard,
+                    horizon_hours=horizon, base_version=version, allocation=split,
+                    proposed_config=_safe(conn, wf, alloc.with_distribution(
+                        cfg, cohort, dim, split)),
                     evidence={
-                        "baseline": {"kpi": kpi, **base.as_dict(), "window_end": hist_end},
-                        "units_per_day": round(per_day, 1), "historical_units": total,
+                        "baseline": {"kpi": kpi, "unit": "first exposure per person",
+                                     **base.as_dict(), "window_end": hist_end},
                         "unit": ("first dial per person" if kpi == "pickup"
                                  else "first connected dial per person"),
-                        "sizing": {"mde": policy.mde, "alpha_per_comparison": policy.alpha / k,
+                        "traffic": {"history_curve": curve,
+                                    "new_units_per_day": new_units_per_day(curve),
+                                    "new_only": new_only,
+                                    "window_units": window_units, "window_days": max_days},
+                        "sizing": {"target_mde": policy.mde, "design_mde": mde,
+                                   "max_acceptable_mde": policy.max_acceptable_mde,
+                                   "alpha_per_comparison": policy.alpha / k,
                                    "power": policy.power, "n_primary": n_primary,
-                                   "n_guardrail": n_guard,
-                                   "guardrail_units_per_primary_unit": g_ratio,
-                                   "guardrail_baseline": g_base, "n_per_arm": n},
-                        "expected_hours": round(hours, 1), "ramp_hours": ramp,
+                                   "n_guardrail": n_guard, "guardrail_baseline": g_base,
+                                   "guardrail_window_units": g_window,
+                                   "n_per_arm": n_primary},
+                        "horizon_hours": round(horizon, 1), "horizon_source": horizon_src,
+                        "expected_hours": round(expected_hours, 1), "ramp_hours": ramp,
                         "mid_flight": wf.mid_flight,
                         "current_distribution": current,
                     })
@@ -296,26 +450,36 @@ def plan(conn: sqlite3.Connection, registry: WorkflowRegistry, workflow_id: str,
     return None, reasons
 
 
+def _safe(conn: sqlite3.Connection, wf: Workflow, cfg: dict) -> dict:
+    """Never propose a config that dials a caller ID with an open incident."""
+    from controller.incidents import open_caller_id_incidents, without_caller_ids
+    bad = open_caller_id_incidents(conn, wf.workflow_id)
+    if not bad:
+        return cfg
+    safe, _ = without_caller_ids(cfg, bad, alloc.options(wf.meta, "caller_id"))
+    return safe
+
+
 def _guardrail_sizing(conn: sqlite3.Connection, wf: Workflow, cohort: str, hist_end: str,
-                      primary_per_day: float, policy: ExperimentPolicy
-                      ) -> tuple[int, float, dict | None]:
-    """(guardrail units per arm, guardrail units per primary unit, baseline).
+                      policy: ExperimentPolicy) -> tuple[int, dict | None, list[int]]:
+    """(guardrail units needed per arm, baseline evidence, guardrail unit curve).
 
     0 units when the workflow states no tolerance (then the guardrail check is
     'no significant drop', which needs no dedicated sizing).
     """
     obj = wf.objective
-    g_base = _baseline_rate(conn, wf.workflow_id, cohort, obj.guardrail)
-    if obj.guardrail_max_drop is None or g_base is None or g_base.value is None:
-        return 0, 0.0, None
+    if obj.guardrail_max_drop is None:
+        return 0, None, []
+    g_base = first_exposure_baseline(conn, wf.workflow_id, cohort, obj.guardrail, hist_end)
+    if g_base.value is None:
+        return 0, None, []
     margin = obj.guardrail_max_drop * (g_base.value if obj.guardrail_relative else 1.0)
     if margin <= 0:
-        return 0, 0.0, None
+        return 0, None, []
     n = noninferiority_sample_size(g_base.value, margin, alpha=policy.alpha,
                                    power=policy.power)
-    g_per_day, _ = daily_units(conn, wf.workflow_id, cohort, obj.guardrail, hist_end)
-    ratio = g_per_day / primary_per_day if primary_per_day else 0.0
-    return n, round(ratio, 4), {**g_base.as_dict(), "margin": round(margin, 4)}
+    curve = unit_curve(conn, wf.workflow_id, cohort, obj.guardrail, hist_end)
+    return n, {**g_base.as_dict(), "margin": round(margin, 4)}, curve
 
 
 # ----------------------------------------------------------------- evaluation
@@ -415,6 +579,47 @@ def decide(*, control: str, candidates: list[str], n_per_arm: int,
             "reason": "no candidate significant and practically meaningful"}
 
 
+def promotion_harm(conn: sqlite3.Connection, registry: WorkflowRegistry, exp: sqlite3.Row,
+                   *, min_n: int = 200, z_harm: float = 3.0) -> dict | None:
+    """After promotion: is the winner now HARMING vs the control holdout?
+
+    Harm-only monitoring (C7). One-sided: primary z <= -z_harm (p ~ 0.0013) with
+    >= min_n first exposures per arm, or a guardrail BREACH (confidently worse
+    than tolerance). It can only trigger a rollback, never a new promotion, so
+    repeated looks don't inflate the winner false-positive rate.
+    """
+    decision = json.loads(exp["decision"] or "{}")
+    rec = decision.get("recommendation") or {}
+    winner, control = decision.get("winner"), exp["control"]
+    if not winner or not exp["promoted_ts"]:
+        return None
+    wf, cohort, dim = exp["workflow_id"], exp["cohort_id"], exp["dimension"]
+    versions = [r[0] for r in conn.execute(
+        "SELECT version FROM workflow_config_snapshots WHERE workflow_id=? AND version>=? "
+        "ORDER BY version", (wf, exp["promoted_version"]))
+        if alloc.same_distribution(
+            alloc.distribution(registry.config(wf, r[0]) or {}, cohort, dim),
+            rec.get("allocation") or {})]
+    args = (conn, wf, cohort, dim)
+    primary = first_exposures(*args, exp["primary_kpi"], versions=versions,
+                              start=exp["promoted_ts"])
+    guard = first_exposures(*args, exp["guardrail_kpi"], versions=versions,
+                            start=exp["promoted_ts"])
+    empty = Rate(0, 0)
+    if min(primary.get(winner, empty).den, primary.get(control, empty).den) < min_n:
+        return None
+    c = compare(primary[control], primary[winner])
+    if c.z <= -z_harm:
+        return {"kpi": exp["primary_kpi"], "reason": f"winner worse than holdout, z={c.z:.2f}",
+                "comparison": c.as_dict()}
+    g = guardrail_check(guard.get(control, empty), guard.get(winner, empty),
+                        exp["guardrail_max_drop"], bool(exp["guardrail_relative"]))
+    if g.status == BREACH:
+        return {"kpi": exp["guardrail_kpi"], "reason": f"guardrail breach: {g.reason}",
+                "comparison": g.comparison}
+    return None
+
+
 # ----------------------------------------------------------------- persistence
 
 
@@ -434,9 +639,10 @@ class ExperimentStore:
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (d.experiment_id, d.workflow_id, d.cohort_id, d.dimension, d.control,
              json.dumps(d.candidates), d.primary_kpi, d.guardrail_kpi, obj.guardrail_max_drop,
-             int(obj.guardrail_relative), policy.alpha, policy.power, policy.mde,
+             int(obj.guardrail_relative), policy.alpha, policy.power,
+             d.evidence["sizing"]["design_mde"],
              policy.min_practical_uplift, d.n_per_arm, d.n_guardrail_per_arm,
-             policy.max_duration_hours,
+             d.horizon_hours,
              d.base_version, json.dumps(d.allocation, sort_keys=True),
              json.dumps(d.proposed_config, sort_keys=True), json.dumps(d.evidence),
              PLANNED, now))
@@ -518,7 +724,7 @@ class ExperimentManager:
         with transaction(self.conn):
             set_state(self.conn, key, now)
             if design is None:
-                log.info("%s: no feasible experiment: %s", wf_id, "; ".join(reasons[-5:]))
+                log.info("%s: no feasible experiment: %s", wf_id, " | ".join(reasons))
                 return None
             if not self.store.create(design, self.policy, self.registry.get(wf_id), now):
                 return None
@@ -541,7 +747,7 @@ class ExperimentManager:
                 self.store.transition(
                     exp["experiment_id"], RUNNING, now, {"start_version": version},
                     start_version=version, start_ts=now,
-                    deadline_ts=add_hours(now, exp["max_duration_hours"]))
+                    deadline_ts=add_hours(now, self._run_hours(exp)))
             return exp["experiment_id"], RUNNING
         if version != exp["base_version"]:
             with transaction(self.conn):
@@ -550,6 +756,16 @@ class ExperimentManager:
                     "base_version": exp["base_version"], "current_version": version})
             return exp["experiment_id"], CANCELLED
         return None   # waiting for governance (M5) to make it live
+
+    def _run_hours(self, exp: sqlite3.Row) -> float:
+        """Run time from go-live: the planned horizon, but never past the point
+        where the post-decision time (promotion + measurement) no longer fits."""
+        hours = exp["max_duration_hours"]
+        end, now = get_state(self.conn, "end_minute"), get_state(self.conn, "sim_minute")
+        if end not in (None, "None") and now not in (None, "None"):
+            left = (int(end) - int(now)) / 60 - self.policy.post_decision_hours
+            hours = min(hours, max(left, 0.0))
+        return hours
 
     # -- running -------------------------------------------------------------
 
@@ -572,6 +788,7 @@ class ExperimentManager:
                     "version": actor[1] if actor else None})
             return exp_id, ABORTED
 
+        self._note_continuation(exp, now)
         versions = self.eligible_versions(exp)
         args = (self.conn, exp["workflow_id"], exp["cohort_id"], exp["dimension"])
         primary = first_exposures(*args, exp["primary_kpi"], versions=versions,
@@ -610,13 +827,39 @@ class ExperimentManager:
         log.info("%s decided: %s (%s)", exp_id, decision["outcome"], decision["reason"])
         return exp_id, DECIDED
 
+    def _note_continuation(self, exp: sqlite3.Row, now: str) -> None:
+        """Log (once per version) that a running experiment continues across a
+        config change that left its allocation under test untouched."""
+        version = self.registry.current_version(exp["workflow_id"])
+        key = f"exp_seen_version:{exp['experiment_id']}"
+        seen = get_state(self.conn, key)
+        if seen in (None, "None"):
+            seen = str(exp["start_version"])
+        if version is None or str(version) == seen:
+            return
+        change = self.conn.execute(
+            "SELECT actor, changed_dims FROM config_changes WHERE workflow_id=? AND "
+            "new_version=? ORDER BY event_id DESC LIMIT 1",
+            (exp["workflow_id"], version)).fetchone()
+        detail = {"version": version, "changed_by": change[0] if change else None,
+                  "changed_dims": json.loads(change[1]) if change else None,
+                  "reason": "allocation under test unchanged; both arms see the change "
+                            "concurrently, so the comparison stays randomised"}
+        with transaction(self.conn):
+            set_state(self.conn, key, version)
+            self.store._log(exp["experiment_id"], now, RUNNING, RUNNING, detail)
+        log.info("experiment %s continues across %s v%s (changed by %s: %s): %s",
+                 exp["experiment_id"], exp["workflow_id"], version, detail["changed_by"],
+                 detail["changed_dims"], detail["reason"])
+
     def _promotion(self, exp: sqlite3.Row, winner: str) -> dict:
         """Recommended (not applied) config: winner gets 1 - holdout, control keeps
         the holdout so the effect can keep being measured for decay (C7)."""
         h = self.policy.promotion_holdout
         dist = {winner: 1 - h, exp["control"]: h} if h > 0 else {winner: 1.0}
         cfg = self.registry.config(exp["workflow_id"]) or {}
+        wf = self.registry.get(exp["workflow_id"])
         return {"cohort_id": exp["cohort_id"], "dimension": exp["dimension"],
                 "allocation": dist, "holdout": h,
-                "proposed_config": alloc.with_distribution(cfg, exp["cohort_id"],
-                                                           exp["dimension"], dist)}
+                "proposed_config": _safe(self.conn, wf, alloc.with_distribution(
+                    cfg, exp["cohort_id"], exp["dimension"], dist))}

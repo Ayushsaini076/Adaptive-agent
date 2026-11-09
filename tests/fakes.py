@@ -96,6 +96,18 @@ class FakeSimulator:
     config_history: dict[str, list[dict]] = field(default_factory=dict)
     scenario: str = "fake_scenario"
     advance_has_clock: bool = True   # False: advance response carries no time
+    # Governance endpoints. Pending approvals are decided on the next advance
+    # (after decide_after_minutes) with ``approval_decision``.
+    approvals: dict[str, dict] = field(default_factory=dict)
+    approval_decision: str = "approved"
+    decide_after_minutes: int = 60
+    apply_window_minutes: int = 120
+    pending_events: list[dict] = field(default_factory=list)
+    applies: list[str] = field(default_factory=list)
+    puts: list[dict] = field(default_factory=list)
+    # Optional generator replacing the default activity: (sim, first_minute,
+    # last_minute) -> events. Lets a test dial with whatever config is LIVE.
+    activity: Callable | None = None
 
     @property
     def finished(self) -> bool:
@@ -110,6 +122,66 @@ class FakeSimulator:
         self.minute = 0
         self.event_chunks = {}
         self.next_event_id = 1000
+
+    def _ts(self, minute: int) -> str:
+        base = datetime.fromisoformat("2027-01-04T00:00:00+05:30")
+        return (base + timedelta(minutes=minute)).isoformat()
+
+    def _event(self, **fields) -> dict:
+        e = {"event_id": self.next_event_id, "ts": self._ts(self.minute), **fields}
+        self.next_event_id += 1
+        self.pending_events.append(e)
+        return e
+
+    def _set_config(self, wf: str, cfg: dict, actor: str, dims: list[str],
+                    proposal_id=None, approval_id=None) -> dict:
+        new = {**cfg, "version": self.configs[wf]["version"] + 1}
+        self.config_history.setdefault(wf, self._history_records(wf)).append(
+            {**_change_record(new["version"], actor, dims), "proposal_id": proposal_id,
+             "approval_id": approval_id})
+        self.configs[wf] = new
+        self._event(type="config_changed", workflow_id=wf, new_version=new["version"],
+                    actor=actor, changed_dims=dims, proposal_id=proposal_id,
+                    approval_id=approval_id)
+        return new
+
+    @staticmethod
+    def _dims(old: dict, new: dict) -> list[str]:
+        dims = set()
+        for k in ("prompt_version", "schedule", "cohorts"):
+            if old.get(k) != new.get(k):
+                dims.add(k)
+        oa, na = old.get("allocations") or {}, new.get("allocations") or {}
+        for cohort in set(oa) | set(na):
+            for d in ("welcome_message", "voice", "caller_id"):
+                if (oa.get(cohort) or {}).get(d) != (na.get(cohort) or {}).get(d):
+                    dims.add(d)
+        return sorted(dims)
+
+    def flush_events(self) -> int | None:
+        """Put pending events into a new chunk now (tests that don't advance)."""
+        if not self.pending_events:
+            return None
+        n = max([*self.event_chunks, *self.history_chunks], default=0) + 1
+        self.event_chunks[n] = self.pending_events
+        self.pending_events = []
+        return n
+
+    def _decide_approvals(self) -> None:
+        for a in self.approvals.values():
+            if a["status"] == "pending" and self.minute - a["submitted_minute"] >= \
+                    self.decide_after_minutes:
+                a["status"] = self.approval_decision
+                a["decided_minute"] = self.minute
+                if a["status"] == "approved":
+                    a["apply_by_minute"] = self.minute + self.apply_window_minutes
+                    a["apply_by"] = self._ts(a["apply_by_minute"])
+                self._event(type="approval_decided", approval_id=a["approval_id"],
+                            workflow_id=a["workflow_id"], status=a["status"],
+                            reasons=["scripted"])
+            if (a["status"] == "approved"
+                    and self.minute > a.get("apply_by_minute", 10**9)):
+                a["status"] = "lapsed"
 
     def _history_records(self, wf: str) -> list[dict]:
         return self.config_history.get(wf) or [_change_record(
@@ -138,15 +210,78 @@ class FakeSimulator:
                 return httpx.Response(422, json={"detail": "minutes must be multiple of 15"})
             if self.finished:
                 return httpx.Response(409, json={"detail": "finished"})
+            start = self.minute
             self.minute += minutes
             n = max([*self.event_chunks, *self.history_chunks], default=0) + 1
             new = [n]
-            self.event_chunks[n] = chunk_of_activity(self.next_event_id, f"camp{n}")
-            self.next_event_id += 100
+            if self.activity is not None:
+                self.event_chunks[n] = self.activity(self, start, self.minute)
+            else:
+                self.event_chunks[n] = chunk_of_activity(self.next_event_id, f"camp{n}")
+                self.next_event_id += 100
+            self._decide_approvals()
+            if self.pending_events:
+                self.event_chunks[n] = self.event_chunks[n] + self.pending_events
+                self.pending_events = []
             body = {"new_chunks": new, "finished": self.finished}
             if self.advance_has_clock:
                 body |= {"sim_minute": self.minute, "ts": self._sim_time()}
             return httpx.Response(200, json=body)
+        if (m, path) == ("POST", "/approvals"):
+            body = json.loads(request.content)
+            if any(a["proposal_id"] == body["proposal_id"] for a in self.approvals.values()):
+                return httpx.Response(409, json={"detail": "duplicate_proposal_id"})
+            for k in ("proposal_id", "workflow_id", "base_version", "proposed_config",
+                      "change_summary", "diff", "dry_run", "rationale"):
+                if not body.get(k) and body.get(k) != 0:
+                    return httpx.Response(422, json={"detail": f"missing {k}"})
+            if not 0 <= body.get("impact_score", -1) <= 1 or body.get("affected_leads", -1) < 0:
+                return httpx.Response(422, json={"detail": "bad impact/affected_leads"})
+            aid = f"apr_{len(self.approvals) + 1}"
+            self.approvals[aid] = {"approval_id": aid, "status": "pending",
+                                   "submitted_minute": self.minute, **body}
+            return httpx.Response(200, json={"approval_id": aid, "status": "pending"})
+        if m == "GET" and parts[0] == "approvals" and len(parts) == 2:
+            a = self.approvals.get(parts[1])
+            if a is None:
+                return httpx.Response(404, json={"detail": "unknown approval"})
+            self._decide_approvals()
+            return httpx.Response(200, json={k: v for k, v in a.items()
+                                             if k != "proposed_config"})
+        if (m, path) == ("GET", "/approvals"):
+            wf = request.url.params.get("workflow_id")
+            return httpx.Response(200, json=[{k: v for k, v in a.items()
+                                              if k != "proposed_config"}
+                                             for a in self.approvals.values()
+                                             if a["workflow_id"] == wf])
+        if m == "POST" and parts[0] == "workflows" and parts[2:] == ["apply"]:
+            wf, aid = parts[1], json.loads(request.content)["approval_id"]
+            a = self.approvals[aid]
+            self._decide_approvals()
+            if a["status"] == "lapsed":
+                return httpx.Response(410, json={"detail": "lapsed"})
+            if a["status"] != "approved":
+                return httpx.Response(409, json={"detail": f"not_approved:{a['status']}"})
+            if a["base_version"] != self.configs[wf]["version"]:
+                return httpx.Response(409, json={"detail": "stale_base_version"})
+            new = self._set_config(wf, a["proposed_config"], "controller_approved",
+                                   self._dims(self.configs[wf], a["proposed_config"]),
+                                   a["proposal_id"], aid)
+            a["status"] = "applied"
+            self.applies.append(aid)
+            return httpx.Response(200, json={"version": new["version"]})
+        if m == "PUT" and parts[0] == "workflows" and parts[2:] == ["config"]:
+            wf, body = parts[1], json.loads(request.content)
+            self.puts.append(body)
+            aa = (self.workflows[wf].get("governance") or {}).get("auto_apply") or {}
+            dims = self._dims(self.configs[wf], body["proposed_config"])
+            if not aa.get("enabled") or set(dims) - set(aa.get("allowed_dims") or []):
+                return httpx.Response(403, json={"detail": "auto_apply_not_permitted"})
+            if body["base_version"] != self.configs[wf]["version"]:
+                return httpx.Response(409, json={"detail": "stale_base_version"})
+            new = self._set_config(wf, body["proposed_config"], "controller_auto", dims,
+                                   body["proposal_id"])
+            return httpx.Response(200, json={"version": new["version"]})
         if (m, path) == ("GET", "/workflows"):
             return httpx.Response(200, json=[{"workflow_id": w, **v}
                                              for w, v in self.workflows.items()])
@@ -188,7 +323,8 @@ class FakeSimulator:
         self.configs[wf] = new
         eid = self.next_event_id
         self.next_event_id += 1
-        return {"event_id": eid, "type": "config_changed", "ts": "2027-01-04T12:00:00+05:30",
+        return {"event_id": eid, "type": "config_changed",
+                "ts": self._ts(max(self.minute, 720)),
                 "workflow_id": wf, "new_version": new["version"], "actor": "supervisor",
                 "changed_dims": sorted(changes)}
 

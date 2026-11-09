@@ -5,6 +5,7 @@ proposed_config, standing in for the M5 approval/apply path.
 """
 
 import json
+from datetime import datetime
 
 import pytest
 
@@ -26,7 +27,8 @@ HIST_END = "2027-01-04T00:00:00+05:30"
 # Primary (pickup, mde 0.2): 93/arm. Guardrail (engagement, tolerance 0.2):
 # 63 connected/arm; at 0.5 connected per dial that is 126 dials -> n_per_arm 126.
 POLICY = ExperimentPolicy(dimensions=("voice",), mde=0.2, min_practical_uplift=0.05,
-                          max_candidates=1, min_history_units=50, max_duration_hours=72)
+                          max_candidates=1, min_history_units=50, max_duration_hours=72,
+                          post_connect_dims_for_pickup=True)   # lifecycle tests only
 
 
 def make_call(eid, person, ts, voice, connected, engaged=None, version=1, cohort="default"):
@@ -123,24 +125,25 @@ def test_plan_is_deterministic_and_sized_from_history(w):
     assert (design.control, design.candidates) == ("v1", ["v2"])
     sizing = design.evidence["sizing"]
     assert (sizing["n_primary"], sizing["n_guardrail"]) == (93, 63)
-    assert sizing["guardrail_units_per_primary_unit"] == 0.5
-    assert design.n_per_arm == 126 and design.n_guardrail_per_arm == 63
+    assert design.n_per_arm == 93 and design.n_guardrail_per_arm == 63
+    assert sizing["design_mde"] == 0.2                      # target affordable: unchanged
     assert design.allocation == {"v1": 0.5, "v2": 0.5}
     assert design.evidence["baseline"]["rate"] == 0.5
-    assert design.evidence["units_per_day"] == 200
+    assert design.evidence["traffic"]["history_curve"] == [200]
+    assert design.evidence["horizon_source"].startswith("fallback 72h")
     # proposed config changes only the cohort/dim under test
     assert design.proposed_config["allocations"]["default"]["welcome_message"] == {"w1": 1.0}
 
 
 def test_plan_explains_infeasibility(w):
-    strict = ExperimentPolicy(dimensions=("voice",), mde=0.01, min_history_units=50)
+    strict = ExperimentPolicy(dimensions=("voice",), post_connect_dims_for_pickup=True, mde=0.01, min_history_units=50)
     design, reasons = plan(w.conn, w.reg, "wf", strict)
     assert design is None
-    assert any("needs" in r and "72h" in r for r in reasons)
+    assert any("even the max acceptable MDE" in r and "horizon 72h" in r for r in reasons)
 
 
 def test_plan_uses_more_candidates_when_affordable(w):
-    two = ExperimentPolicy(dimensions=("voice",), mde=0.2, max_candidates=2,
+    two = ExperimentPolicy(dimensions=("voice",), post_connect_dims_for_pickup=True, mde=0.2, max_candidates=2,
                            min_history_units=50, max_duration_hours=72)
     design, _ = plan(w.conn, w.reg, "wf", two)
     assert design.candidates == ["v2", "v3"]
@@ -148,13 +151,14 @@ def test_plan_uses_more_candidates_when_affordable(w):
 
 
 def test_dimension_with_single_option_is_skipped(w):
-    p = ExperimentPolicy(dimensions=("welcome_message",), mde=0.2, min_history_units=50)
+    p = ExperimentPolicy(dimensions=("welcome_message",), mde=0.2, min_history_units=50,
+                         post_connect_dims_for_pickup=True)
     design, reasons = plan(w.conn, w.reg, "wf", p)
     assert design is None and any("fewer than 2 options" in r for r in reasons)
 
 
 def test_replan_waits_for_interval(tmp_path):
-    w = World(tmp_path, policy=ExperimentPolicy(dimensions=("voice",), mde=0.01,
+    w = World(tmp_path, policy=ExperimentPolicy(dimensions=("voice",), post_connect_dims_for_pickup=True, mde=0.01,
                                                 min_history_units=50))
     assert w.mgr.tick() == []                                  # infeasible, attempt recorded
     n = w.conn.execute("SELECT value FROM controller_state WHERE key='exp_plan_attempt:wf'"
@@ -375,3 +379,177 @@ def test_underpowered_guardrail_is_unverified_not_breach():
     d = _decide(p, g, candidates=("b",), n_per_arm=1000, max_drop=0.03)
     assert d["tests"]["b"]["guardrail"]["status"] == "unverified"
     assert d["outcome"] == "guardrail_unverified" and d["winner"] is None
+
+
+
+# ------------------------------------------------------------------ planner traffic & horizon
+
+from controller.database import set_state  # noqa: E402
+from controller.experiments import (  # noqa: E402
+    design_mde,
+    first_exposure_baseline,
+    planning_horizon,
+    unit_curve,
+    units_within,
+)
+
+
+def _two_day_history(tmp_path):
+    """Day 1: persons a0..a99. Day 2: same 100 re-dialled + 50 new b-persons."""
+    w = World(tmp_path)
+    calls = []
+    eid = 70_000
+    for i in range(100):
+        calls.append(make_call(eid, f"a{i}", "2027-01-02T10:00:00+05:30", "v1", i % 2 == 0))
+        eid += 1
+    for i in range(100):
+        calls.append(make_call(eid, f"a{i}", "2027-01-03T10:00:00+05:30", "v1", True))
+        eid += 1
+    for i in range(50):
+        calls.append(make_call(eid, f"b{i}", "2027-01-03T11:00:00+05:30", "v1", False))
+        eid += 1
+    w.conn.execute("DELETE FROM calls")
+    w.ingest(calls)
+    return w
+
+
+def test_unit_curve_counts_redialled_people_once(tmp_path):
+    w = _two_day_history(tmp_path)
+    curve = unit_curve(w.conn, "wf", "default", "pickup", HIST_END)
+    assert curve == [100, 150]          # NOT 100 + 150 = 250 (old per-day overcount)
+    assert units_within(curve, 1) == 100 and units_within(curve, 2) == 150
+    assert units_within(curve, 4) == 150 + 2 * 50       # extends with new people/day
+    assert units_within(curve, 3, new_only=True) == 150  # next_campaign_only: new only
+
+
+def test_first_exposure_baseline_uses_first_dial_only(tmp_path):
+    w = _two_day_history(tmp_path)
+    # a-persons: first dial 50% connected (later re-dials all connected, ignored);
+    # b-persons: 0%. -> 50/150, not the all-dials rate 150/250.
+    assert first_exposure_baseline(w.conn, "wf", "default", "pickup", HIST_END) == Rate(50, 150)
+
+
+def test_planning_horizon_uses_time_left_in_scenario(w):
+    p = ExperimentPolicy()
+    assert planning_horizon(w.conn, p, 0)[0] == 72                     # fallback
+    with transaction(w.conn):
+        set_state(w.conn, "end_minute", 14400)
+        set_state(w.conn, "sim_minute", 0)
+    hours, src = planning_horizon(w.conn, p, 24)
+    assert hours == 240 - 24 - 48 - 24 and src.startswith("scenario: 240h left")
+    capped = ExperimentPolicy(max_duration_hours=100)
+    assert planning_horizon(w.conn, capped, 0)[0] == 100
+
+
+def test_design_mde_prefers_target_then_relaxes_up_to_max():
+    p = ExperimentPolicy(mde=0.03, max_acceptable_mde=0.05)
+    assert design_mde(0.5, 5000, p, 1) == 0.03                       # target affordable
+    relaxed = design_mde(0.5, 2500, p, 1)
+    assert 0.03 < relaxed <= 0.05
+    from controller.stats import sample_size_per_arm
+    assert sample_size_per_arm(0.5, relaxed) <= 2500                  # alpha/power unchanged
+    assert design_mde(0.5, 1000, p, 1) is None                       # 5pp needs ~1,565
+
+
+def test_long_scenario_window_makes_design_feasible(tmp_path):
+    """Infeasible within the 72h fallback, feasible within the real scenario window."""
+    w = World(tmp_path)
+    p = ExperimentPolicy(dimensions=("voice",), post_connect_dims_for_pickup=True, mde=0.1, max_acceptable_mde=0.1,
+                         max_candidates=1, min_history_units=50)
+    assert plan(w.conn, w.reg, "wf", p)[0] is None
+    with transaction(w.conn):
+        set_state(w.conn, "end_minute", 14400)
+        set_state(w.conn, "sim_minute", 0)
+    design, _ = plan(w.conn, w.reg, "wf", p)
+    assert design is not None and design.horizon_hours == 168
+    assert design.evidence["expected_hours"] <= 168
+
+
+def test_mde_relaxed_within_max_is_recorded(tmp_path):
+    w = World(tmp_path)
+    p = ExperimentPolicy(dimensions=("voice",), post_connect_dims_for_pickup=True, mde=0.05, max_acceptable_mde=0.25,
+                         max_candidates=1, min_history_units=50)
+    design, _ = plan(w.conn, w.reg, "wf", p)       # 72h fallback: ~3 days of 200/day
+    sizing = design.evidence["sizing"]
+    assert 0.05 < sizing["design_mde"] <= 0.25
+    exp_id = _planned_with(w, p)
+    assert w.exp(exp_id)["mde"] == sizing["design_mde"]
+
+
+def _planned_with(w, policy):
+    w.mgr = ExperimentManager(w.conn, w.reg, policy)
+    changes = w.mgr.tick()
+    assert changes and changes[0][1] == "planned"
+    return changes[0][0]
+
+
+def test_guardrail_bound_rejection_explains_itself(tmp_path):
+    """nw_kyc-like: a tight guardrail tolerance needs more units than the window has."""
+    w = World(tmp_path, max_drop=0.01)
+    design, reasons = plan(w.conn, w.reg, "wf", POLICY)
+    assert design is None
+    assert any("guardrail engagement non-inferiority needs" in r and "window gives" in r
+               for r in reasons)
+
+
+def test_deadline_leaves_room_for_post_decision(w):
+    exp_id = _planned(w)                                   # planned with a 72h horizon
+    with transaction(w.conn):                              # approval took long: 60h left
+        set_state(w.conn, "end_minute", 14400)
+        set_state(w.conn, "sim_minute", 14400 - 60 * 60)
+    w.go_live(exp_id)
+    w.mgr.tick()
+    e = w.exp(exp_id)
+    hours = (datetime.fromisoformat(e["deadline_ts"])
+             - datetime.fromisoformat(e["start_ts"])).total_seconds() / 3600
+    assert hours == 60 - 48                                # post-decision time kept free
+
+
+
+def test_no_plan_when_scenario_too_short_for_post_decision(w):
+    with transaction(w.conn):
+        set_state(w.conn, "end_minute", 14400)
+        set_state(w.conn, "sim_minute", 14400 - 60 * 60)
+    design, reasons = plan(w.conn, w.reg, "wf", POLICY)
+    assert design is None and "under one day" in reasons[0]
+
+
+# ------------------------------------------------------------------ dimension applicability
+
+
+def test_post_connect_dims_skipped_for_pickup_primary(w):
+    p = ExperimentPolicy(mde=0.2, min_history_units=50)     # default: no opt-in
+    design, reasons = plan(w.conn, w.reg, "wf", p)
+    assert design is None
+    assert any("voice: acts only after a call connects" in r for r in reasons)
+
+
+def test_running_experiment_logs_continuation_across_unrelated_edit(w, caplog):
+    import logging
+    exp_id = _running(w)
+    w.edit(prompt_version="p2", allocations=w.reg.config("wf")["allocations"])
+    with caplog.at_level(logging.INFO):
+        assert w.mgr.tick() == []
+        assert w.mgr.tick() == []                              # logged once per version
+    assert caplog.text.count("continues across wf v3 (changed by supervisor") == 1
+    rows = w.conn.execute("SELECT from_status, to_status, detail FROM experiment_log "
+                          "WHERE experiment_id=? ORDER BY id", (exp_id,)).fetchall()
+    assert [(r[0], r[1]) for r in rows][-1] == ("running", "running")
+    assert json.loads(rows[-1][2])["changed_dims"] == ["allocations", "prompt_version"]
+
+
+def test_proposed_config_never_dials_caller_id_with_open_incident(w):
+    w.conn.execute(
+        "INSERT INTO incidents(incident_id, kind, workflow_id, subject, status, detected_ts, "
+        "evidence, mitigation) VALUES ('i1','caller_id_health','wf','c_bad','detected',"
+        "'2027-01-04T10:00:00+05:30','{}','{}')")
+    cfg = w.reg.config("wf")
+    w.sim.configs["wf"] = {**cfg, "version": cfg["version"]}
+    w.reg.conn.execute("UPDATE workflow_config_snapshots SET config=? WHERE workflow_id='wf'",
+                       (json.dumps({**cfg, "allocations": {**cfg["allocations"], "default": {
+                           **cfg["allocations"]["default"],
+                           "caller_id": {"c_ok": 0.5, "c_bad": 0.5}}}}),))
+    w.sim.workflows["wf"]["options"]["caller_id"] = ["c_ok", "c_bad"]
+    w.reg.refresh("wf")
+    design, _ = plan(w.conn, w.reg, "wf", POLICY)
+    assert design.proposed_config["allocations"]["default"]["caller_id"] == {"c_ok": 1.0}

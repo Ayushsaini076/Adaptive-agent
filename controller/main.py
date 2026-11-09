@@ -27,6 +27,8 @@ from collections import Counter
 from controller.client import ScenarioFinished, SimulatorClient, SimulatorError, sim_clock
 from controller.database import set_state, transaction
 from controller.experiments import ExperimentManager
+from controller.governance import GovernanceManager
+from controller.incidents import CallerIdMonitor
 from controller.ingestion import EventIdCollision, Ingester, IngestStats
 from controller.metrics import snapshot_baselines
 from controller.settings import Settings
@@ -149,6 +151,9 @@ def run(settings: Settings, client: SimulatorClient, conn: sqlite3.Connection,
 
     state = client.state()
     log.info("simulator state: %s", state)
+    if state.get("end_minute") is not None:   # scenario length, for experiment horizons
+        with transaction(conn):
+            set_state(conn, "end_minute", int(state["end_minute"]))
 
     registry = WorkflowRegistry(conn, client)
     summary.workflows = registry.sync_all()
@@ -159,7 +164,11 @@ def run(settings: Settings, client: SimulatorClient, conn: sqlite3.Connection,
              summary.history.chunks, summary.history.events, summary.history.inserted)
     snapshot_history_baselines(conn, summary.workflows)
     experiments = ExperimentManager(conn, registry)
+    caller_ids = CallerIdMonitor(conn, registry)
+    governance = GovernanceManager(conn, client, registry)
+    governance.log_policies()
     _tick_experiments(experiments)
+    governance.reconcile(governance.now() or "")    # restart: resume in-flight approvals
 
     # Recover chunks from an advance whose ingestion didn't commit before a crash.
     live = ingester.catch_up("events")
@@ -197,7 +206,9 @@ def run(settings: Settings, client: SimulatorClient, conn: sqlite3.Connection,
         for r in step.results:
             live.add(r)
         registry.refresh_changed()
+        caller_ids.tick()            # before experiments: proposals exclude flagged IDs
         _tick_experiments(experiments)
+        governance.tick()            # the only path that changes a config
         # Time is recorded only after its chunks are committed.
         _record_time(conn, sim_time, sim_minute, result.finished)
         actors = Counter(c["actor"] or "unknown" for c in registry.last_changes)

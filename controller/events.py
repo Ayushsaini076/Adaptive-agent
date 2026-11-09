@@ -159,7 +159,7 @@ def call_row(raw: JSON, eid: int) -> tuple:
         _get(raw, "campaign_id"),
         _get(raw, "lead_id"),
         _get(raw, "person_id"),
-        _int_or_none(_get(raw, "attempt", "attempt_number")),
+        _int_or_none(_get(raw, "attempt_no", "attempt", "attempt_number")),
         _int_or_none(_get(raw, "campaign_day", "campaign_day_index", "day_index")),
         _int_or_none(_get(raw, "config_version")),
         _get(raw, "cohort_id"),

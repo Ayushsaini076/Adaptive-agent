@@ -10,8 +10,9 @@ An outcome-first controller for a simulated outbound voice-agent platform. It ta
 | 2. SQLite and safe ingestion | **Done**: unit- and hard-kill-tested against a fake |
 | 3. Features, cohorts, KPI aggregation | **Done** |
 | 4. First controlled experiment | **Done**: design, exposure counting and decision; go-live waits for M5 |
-| 5. Governance and audit | Next |
-| 6–7 | Not started |
+| 5. Governance and audit | **Done**: approval/auto-apply lifecycle, audit query; tested on the fake |
+| 6. Incidents, decay, rollback | Partial: caller-ID health and post-promotion rollback done; prompt incidents (C8) next |
+| 7 | Not started |
 
 All development and testing uses the in-repo fake simulator (`tests/fakes.py`).
 
@@ -67,6 +68,13 @@ controller/
   stats.py     sample sizes, two-proportion test, Newcombe CI, Holm (pure functions)
   allocations.py  the only module that reads/edits config allocations and options
   experiments.py  experiment planning, first-exposure counts, decision, lifecycle
+  incidents.py    caller-ID health (C5): detection, incident record, mitigation proposal
+  policy.py       per-workflow governance policy from metadata + operator preferences
+  impact.py       proposal evidence: diff, affected leads, dry run, impact score
+  governance.py   the ONLY path that changes a config: approvals, auto-apply, apply, reconcile
+  audit.py        audit query CLI: why a config changed, who approved, before/after KPIs
+config/
+  operator_preferences.json   stricter client limits by tenant (can only tighten)
   report.py    read-only KPI report CLI
   main.py      entry point and main loop (bootstrap, advance, ingest, refresh configs)
 tests/
@@ -117,12 +125,13 @@ The controller plans one experiment per workflow at a time, detects when its all
 
 | Question the spec asks | Answer |
 |---|---|
-| **What is tested** | One dimension at a time: `welcome_message`, then `voice`. `caller_id` is left to caller-ID health (C5) and `prompt_version` to the prompt-incident path (C8), so attributions don't mix. |
+| **What is tested** | One dimension at a time: `welcome_message`, then `voice`. Both are heard only *after* a call connects, so they are tested only for workflows whose primary KPI is **engagement**; for pickup-primary workflows the planner skips them and logs why. `caller_id` is left to caller-ID health (C5) and `prompt_version` to the prompt-incident path (C8), so attributions don't mix. |
 | **Populations** | One cohort from the canonical model, searched in order of historical volume. Control is the cohort's current dominant option. Candidates are untested options from the workflow's live `options`. Traffic is split equally, so control keeps 1/(k+1). |
 | **Unit and repeat dials** | One observation per person. Pickup uses each person's first dial in the window; engagement uses each person's first *connected* dial. The arm is the variant recorded on that call. Repeat dials stay in operational KPIs but not in the test. |
 | **Which calls count** | Only calls from config versions whose allocation for (cohort, dimension) equals the design, from go-live on. A candidate counts as tested only if a statistical test actually ran on it. Under-exposed or never-exposed candidates can be planned again. |
-| **Minimum sample per arm** | The larger of two numbers. (1) Primary KPI: two-proportion sample size from the historical baseline, powered at 80% for an absolute uplift of `mde` (default 3pp), with α/k for k candidates. (2) Guardrail: non-inferiority sample size for the stated tolerance, converted into primary units with the historical ratio (e.g. connected per dial). |
-| **Feasibility** | The design must be expected to finish within `max_duration_hours` (default 72h), plus a 24h ramp for `next_campaign_only` workflows. Otherwise fewer candidates are tried, then the next cohort or dimension. The reasons for any rejection are logged. |
+| **Minimum sample per arm** | Primary KPI: two-proportion sample size at α/k and 80% power. The baseline is each person's *first exposure* in history (the same unit the test uses). Guardrail: a non-inferiority sample size for the stated tolerance, in guardrail units (e.g. connected calls); the experiment waits for both. |
+| **Uplift threshold (MDE)** | Powered for a target of 3pp. If the window can't support 3pp, the smallest uplift it *can* detect is used, up to a maximum acceptable 5pp (rounded up to 0.1pp) and recorded in the design. α and power never change, so a larger MDE means more missed small effects, never more false winners. Above 5pp the experiment isn't run. |
+| **Traffic and horizon** | Traffic comes from the cumulative number of distinct people seen in the first 1..D days of history (a re-dialled person counts once), extended with the last day's *new* people. For `next_campaign_only` workflows only new people are counted, plus a 24h ramp. The horizon is the time left in the scenario minus 24h for approval and 48h for promotion and after-measurement (72h fallback if the end is unknown). The deadline at go-live is capped so the post-decision time still fits. Every rejection logs the horizon, units per arm in the window, and the primary and guardrail sample needs. |
 | **Stopping rule** | Fixed horizon. Interim ticks check only the counts; the test runs once, when every arm has its primary and guardrail sample or the deadline passes. There is no peeking. |
 | **Test** | Pooled two-proportion z-test, two-sided, with a Newcombe 95% interval on the difference. |
 | **Multiple comparisons** | Holm-Bonferroni across all planned candidates. Under-exposed candidates stay in the family with p = 1. |
@@ -141,3 +150,55 @@ The controller plans one experiment per workflow at a time, detects when its all
 - `running` becomes `decided` when the test runs. Per-arm counts at decision time are stored in `experiment_evaluations`.
 
 **Clock.** Experiment timing uses each workflow's latest ingested call time (`data_clock`), not the `/sim/advance` response, which doesn't yet report time.
+
+## Caller-ID health (C5)
+
+The controller compares each caller ID's pickup with the other caller IDs of the same workflow in a rolling 6-hour window. Caller ID is sampled independently on every dial, so this is a randomised, same-hours, same-audience comparison. An incident opens only when **all** of these hold:
+
+- at least 300 dials for the caller ID and for its peers in the window;
+- a one-sided z ≤ −4 (about 3×10⁻⁵ per check);
+- a relative drop of at least 30%;
+- the breach persists for 3 hours.
+
+One bad call, a small sample, a single bad hour or a mild dip never triggers it. The detection lag is about 6 hours after onset. A workflow with only one caller ID is compared with its own history instead.
+
+**What happens on detection:**
+
+- An `incidents` row is written (status `detected`) with the window counts, z, drop and policy, plus a `incident_log` entry and a `CALLER-ID INCIDENT` WARNING.
+- A mitigation is **proposed**: the caller ID's weight is moved to the remaining healthy IDs (or to the other allowed options), recorded with the total-variation shift per cohort. Submitting it is governance (Milestone 5); this module never changes a config.
+- While the incident is open, every experiment proposal and promotion leaves that caller ID out.
+- When the live config no longer allocates the caller ID, whether by an applied proposal or a supervisor edit, the incident becomes `mitigated` and records who changed it.
+
+## Governance (Milestone 5)
+
+`controller/governance.py` is the only code that changes a workflow config. Each tick, per workflow:
+
+1. **Reconcile** in-flight approvals (`GET /approvals/{id}`) and apply approved ones within their apply window.
+2. **Collect intents** in priority order: incident mitigation, rollback, promotion, experiment go-live. Only one intent per (cohort, dimension).
+3. **Respect supervisors.** An intent whose dimension a supervisor edited afterwards is dropped and escalated, never overridden, even if the dimension is auto-apply eligible. If the live config moved but its `config_changed` event hasn't been ingested yet, nothing is proposed until the author is known.
+4. **Build one batched proposal** from a fresh `GET /config`, changing only the intended (cohort, dimension) slots, so a supervisor's edits are never reverted.
+5. **Validate.** Every value must be in the workflow's `options`. No caller ID with an open incident may be included. A `prompt_version` change needs `validation_run_id` evidence with a pass rate ≥ `min_validation_pass_rate`.
+6. **Route.**
+   - `PUT /config` only if auto-apply is enabled **and** every changed dimension is in `allowed_dims` **and** every per-cohort TV shift is ≤ `max_shift`.
+   - Otherwise `POST /approvals`, but only if worst-case approver latency still fits inside approver hours before the TTL expires, and the request limit (simulator, or tighter operator preference) allows it.
+   - Otherwise wait, and log why once.
+
+**Proposal lifecycle:**
+
+- `pending` → `approved` → `applied`.
+- `approved` → `lapsed` (apply window missed) or `stale` (409, base changed): re-proposed under a **new** id from fresh data.
+- `expired` is distinct from `rejected` and is retried.
+- `rejected` drops the intent; a rejected experiment go-live cancels the experiment.
+- At most one request is in flight per workflow, and after 3 failed attempts the intent escalates to a human.
+- Every step writes `audit_log` plus a `GOVERNANCE` WARNING line.
+- The parsed policy of every workflow is logged at startup.
+
+**Every proposal carries** a stable `proposal_id`, the exact `base_version`, the full config, a summary, a diff with per-cohort TV shift, `affected_leads` (with its basis), a dry run built from observed data, an `impact_score`, and a rationale. Impact score = `min(1, |expected pp| / 5) × traffic share changed × confidence` (0.9 measured, 0.5 rollback, 0.3 exploratory); the inputs are kept in the dry run.
+
+**Audit query:**
+
+```bash
+.venv/bin/python -m controller.audit --workflow ks_cancel
+```
+
+For each config version it shows who changed it, the proposal and approval, the evidence and rationale, every governance step, and observational KPIs for 24h before and after (pickup and engagement with their own denominators, plus pickup per caller ID).

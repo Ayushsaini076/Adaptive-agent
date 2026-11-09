@@ -273,6 +273,72 @@ MIGRATIONS: list[Migration] = [
         PRIMARY KEY (experiment_id, sim_ts, arm, kpi)
     );
     """,
+    # 4: incidents
+    """
+    CREATE TABLE incidents (
+        incident_id  TEXT PRIMARY KEY,     -- inc:<kind>:<workflow>:<subject>:<breach start>
+        kind         TEXT NOT NULL,        -- caller_id_health | ...
+        workflow_id  TEXT NOT NULL,
+        subject      TEXT NOT NULL,        -- e.g. the caller ID
+        status       TEXT NOT NULL,        -- detected | mitigated
+        detected_ts  TEXT NOT NULL,        -- simulated time
+        mitigated_ts TEXT,
+        evidence     TEXT NOT NULL,        -- JSON: window counts, z, drop, policy
+        mitigation   TEXT NOT NULL,        -- JSON: proposed config + TV shifts, or why none
+        updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_incidents_wf ON incidents(workflow_id, kind, status);
+
+    CREATE TABLE incident_log (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        incident_id TEXT NOT NULL,
+        sim_ts      TEXT NOT NULL,
+        from_status TEXT,
+        to_status   TEXT NOT NULL,
+        detail      TEXT NOT NULL,
+        logged_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_incident_log_inc ON incident_log(incident_id, id);
+    """,
+    # 5: governance (proposals, audit log) + experiment promotion columns
+    """
+    ALTER TABLE experiments ADD COLUMN promoted_ts TEXT;
+    ALTER TABLE experiments ADD COLUMN promoted_version INTEGER;
+
+    -- One row per submission attempt. proposal_id is the idempotency key and is
+    -- never reused: a stale/expired/lapsed request is re-proposed under a NEW id.
+    CREATE TABLE proposals (
+        proposal_id     TEXT PRIMARY KEY,
+        workflow_id     TEXT NOT NULL,
+        intents         TEXT NOT NULL,       -- JSON [{kind, ref}]
+        route           TEXT NOT NULL,       -- auto | approval
+        base_version    INTEGER NOT NULL,
+        payload         TEXT NOT NULL,       -- exactly what was sent
+        status          TEXT NOT NULL,       -- pending|approved|applied|auto_applied|rejected|expired|lapsed|stale|failed
+        approval_id     TEXT,
+        apply_by        TEXT,
+        applied_version INTEGER,
+        submitted_ts    TEXT NOT NULL,       -- simulated time
+        decided_ts      TEXT,
+        reasons         TEXT,                -- JSON from the approver / errors
+        updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_proposals_wf ON proposals(workflow_id, status);
+    CREATE INDEX idx_proposals_approval ON proposals(approval_id);
+
+    -- Append-only record of every governance decision and change.
+    CREATE TABLE audit_log (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        sim_ts      TEXT,
+        workflow_id TEXT,
+        action      TEXT NOT NULL,
+        ref         TEXT,                    -- proposal / experiment / incident id
+        detail      TEXT NOT NULL,           -- JSON
+        logged_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_audit_wf ON audit_log(workflow_id, id);
+    CREATE INDEX idx_audit_ref ON audit_log(ref, id);
+    """,
 ]
 
 

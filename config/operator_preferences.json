@@ -1,0 +1,7 @@
+{
+  "_note": "Client-requested limits that are STRICTER than the simulator policy. Keyed by tenant_id. They can only tighten limits, never loosen them. Source: Kestrel operations supervisor memo (max two approval requests per day, none before 11:00).",
+  "kestrel_finance": {
+    "max_requests_per_24h": 2,
+    "earliest_submit_hour": 11
+  }
+}

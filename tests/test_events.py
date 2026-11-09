@@ -50,3 +50,20 @@ def test_event_id_and_type_aliases():
         ev.event_id({"type": "call"})
     with pytest.raises(ev.InvalidEvent):
         ev.event_id({"event_id": "abc"})
+
+
+def test_real_call_payload_maps_all_fields():
+    """Shape observed on public_02_incidents (attempt is 'attempt_no')."""
+    real = {"type": "call", "ts": "2027-01-13T20:45:00+05:30", "tenant_id": "kestrel_finance",
+            "workflow_id": "ks_cancel", "campaign_id": "ks_cancel:c0024",
+            "lead_id": "ks_cancel:l00035892", "person_id": "ks_cancel:p0025575",
+            "attempt_no": 2, "campaign_day_index": 0, "config_version": 2,
+            "cohort_id": "default",
+            "variant": {"welcome_message": "W1", "voice": "V1", "caller_id": "D1",
+                        "prompt_version": "P2"},
+            "connected": False, "engaged": False, "disposition": "no_answer",
+            "duration_s": 0, "turns": 0, "qa": None, "event_id": 324324}
+    row = ev.call_row(real, 324324)
+    assert row[7] == 2 and row[8] == 0            # attempt, campaign_day
+    assert row[11:15] == ("W1", "V1", "D1", "P2")
+    assert row[19] == 0 and row[20] is None       # turns, no QA when not connected

@@ -320,6 +320,32 @@ class SimulatorClient:
         """Convenience for small chunks / tests. Prefer ``iter_chunk`` at scale."""
         return list(self.iter_chunk(chunk_number))
 
+    # -- governance -------------------------------------------------------------
+    # Never retried automatically (see module docstring). Approval submission is
+    # idempotent on proposal_id; callers handle a 409 duplicate by looking it up.
+
+    def submit_approval(self, payload: JSON) -> JSON:
+        return self._send("POST", "/approvals", payload)
+
+    def get_approval(self, approval_id: str) -> JSON:
+        return self._get(f"/approvals/{approval_id}")
+
+    def list_approvals(self, workflow_id: str, status: str | None = None) -> list[JSON]:
+        params = {"workflow_id": workflow_id}
+        if status:
+            params["status"] = status
+        payload = self._get("/approvals", params=params)
+        if isinstance(payload, dict):
+            payload = _first(payload, "approvals", "items", default=[])
+        return list(payload)
+
+    def apply_approval(self, workflow_id: str, approval_id: str) -> JSON:
+        return self._send("POST", f"/workflows/{workflow_id}/apply",
+                          {"approval_id": approval_id})
+
+    def put_config(self, workflow_id: str, body: JSON) -> JSON:
+        return self._send("PUT", f"/workflows/{workflow_id}/config", body)
+
     # -- time -------------------------------------------------------------------
 
     def advance(self, minutes: int) -> AdvanceResult:
