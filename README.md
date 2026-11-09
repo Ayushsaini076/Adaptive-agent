@@ -9,8 +9,9 @@ An outcome-first controller for a simulated outbound voice-agent platform. It ta
 | 1. Skeleton and simulator HTTP client | **Done**: unit-tested against a fake |
 | 2. SQLite and safe ingestion | **Done**: unit- and hard-kill-tested against a fake |
 | 3. Features, cohorts, KPI aggregation | **Done** |
-| 4. First controlled experiment | Next |
-| 5–7 | Not started |
+| 4. First controlled experiment | **Done**: design, exposure counting and decision; go-live waits for M5 |
+| 5. Governance and audit | Next |
+| 6–7 | Not started |
 
 All development and testing uses the in-repo fake simulator (`tests/fakes.py`).
 
@@ -55,6 +56,9 @@ controller/
   cohorts.py   THE canonical cohort model (matching, versioned sets, small-sample rule)
   workflows.py registry: objective/guardrail parsing, immutable config + cohort snapshots
   metrics.py   pickup / engagement / business outcome, Wilson CIs, aggregates, baselines
+  stats.py     sample sizes, two-proportion test, Newcombe CI, Holm (pure functions)
+  allocations.py  the only module that reads/edits config allocations and options
+  experiments.py  experiment planning, first-exposure counts, decision, lifecycle
   report.py    read-only KPI report CLI
   main.py      entry point and main loop (bootstrap, advance, ingest, refresh configs)
 tests/
@@ -98,3 +102,34 @@ tests/
 - **Timestamps** are normalised to ISO-8601 IST at ingestion, so string order is time order and the first 13 characters give the hour bucket.
 
 Ingestion with aggregates measured about 41k events/s on 200k fake events.
+
+## Experiments (Milestone 4)
+
+The controller plans one experiment per workflow at a time, detects when its allocation is live, and decides once the predeclared sample is reached. In this milestone nothing makes a design live; that's the governance path in Milestone 5. Every decision is a pure function of stored counts. No LLM is involved.
+
+| Question the spec asks | Answer |
+|---|---|
+| **What is tested** | One dimension at a time: `welcome_message`, then `voice`. `caller_id` is left to caller-ID health (C5) and `prompt_version` to the prompt-incident path (C8), so attributions don't mix. |
+| **Populations** | One cohort from the canonical model, searched in order of historical volume. Control is the cohort's current dominant option. Candidates are untested options from the workflow's live `options`. Traffic is split equally, so control keeps 1/(k+1). |
+| **Unit and repeat dials** | One observation per person. Pickup uses each person's first dial in the window; engagement uses each person's first *connected* dial. The arm is the variant recorded on that call. Repeat dials stay in operational KPIs but not in the test. |
+| **Which calls count** | Only calls from config versions whose allocation for (cohort, dimension) equals the design, from go-live on. A candidate counts as tested only if a statistical test actually ran on it. Under-exposed or never-exposed candidates can be planned again. |
+| **Minimum sample per arm** | The larger of two numbers. (1) Primary KPI: two-proportion sample size from the historical baseline, powered at 80% for an absolute uplift of `mde` (default 3pp), with α/k for k candidates. (2) Guardrail: non-inferiority sample size for the stated tolerance, converted into primary units with the historical ratio (e.g. connected per dial). |
+| **Feasibility** | The design must be expected to finish within `max_duration_hours` (default 72h), plus a 24h ramp for `next_campaign_only` workflows. Otherwise fewer candidates are tried, then the next cohort or dimension. The reasons for any rejection are logged. |
+| **Stopping rule** | Fixed horizon. Interim ticks check only the counts; the test runs once, when every arm has its primary and guardrail sample or the deadline passes. There is no peeking. |
+| **Test** | Pooled two-proportion z-test, two-sided, with a Newcombe 95% interval on the difference. |
+| **Multiple comparisons** | Holm-Bonferroni across all planned candidates. Under-exposed candidates stay in the family with p = 1. |
+| **Practical significance** | The uplift must be at least `min_practical_uplift` (default 1pp), as well as Holm-significant. |
+| **Guardrail** | Non-inferiority on the 95% CI of (candidate − control). **Pass** if the lower bound ≥ −tolerance. **Breach** if the upper bound < −tolerance. Otherwise **unverified**, which is never promoted and never reported as a breach. The tolerance comes from the workflow objective (absolute, or relative to the control rate). With no stated tolerance, only a significant drop counts as a breach. |
+| **Choosing among winners** | The highest lower confidence bound, not the highest raw rate. Ties go to declared option order. |
+| **Outcomes** | `winner`, `no_winner`, `guardrail_breach`, `guardrail_unverified`, `inconclusive` (control or all candidates under-exposed at the deadline). |
+| **Promotion** | A recommendation only. The winner gets 90% and control keeps a 10% holdout, so decay can still be measured (C7). Applying it is Milestone 5. |
+| **False-positive trade-off** | Family-wise α = 5% per experiment and 80% power at the MDE. A smaller MDE means fewer false negatives but longer experiments; experiments that don't fit the deadline aren't started. |
+
+**Lifecycle** (persisted in `experiments`; every transition appended to `experiment_log`):
+
+- `planned` becomes `running` when the live config's allocation matches the design.
+- `planned` becomes `cancelled` if the base config changes before go-live.
+- `running` becomes `aborted` if the allocation under test is changed, e.g. by a supervisor; the actor is recorded.
+- `running` becomes `decided` when the test runs. Per-arm counts at decision time are stored in `experiment_evaluations`.
+
+**Clock.** Experiment timing uses each workflow's latest ingested call time (`data_clock`), not the `/sim/advance` response, which doesn't yet report time.

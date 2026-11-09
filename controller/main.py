@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 from controller.client import ScenarioFinished, SimulatorClient, SimulatorError
 from controller.database import connect, set_state, transaction
+from controller.experiments import ExperimentManager
 from controller.ingestion import Ingester, IngestStats
 from controller.metrics import snapshot_baselines
 from controller.settings import Settings
@@ -119,6 +120,11 @@ def snapshot_history_baselines(conn: sqlite3.Connection, workflow_ids: list[str]
                  wf, end, wide.get("pickup"), wide.get("engagement"))
 
 
+def _tick_experiments(manager: ExperimentManager) -> None:
+    for exp_id, status in manager.tick():
+        log.info("experiment %s -> %s", exp_id, status)
+
+
 def _record_time(conn: sqlite3.Connection, sim_time: str | None, finished: bool) -> None:
     with transaction(conn):
         if sim_time is not None:
@@ -143,6 +149,8 @@ def run(settings: Settings, client: SimulatorClient, conn: sqlite3.Connection,
     log.info("history bootstrap: %d chunks, %d events (%d new)",
              summary.history.chunks, summary.history.events, summary.history.inserted)
     snapshot_history_baselines(conn, summary.workflows)
+    experiments = ExperimentManager(conn, registry)
+    _tick_experiments(experiments)
 
     # Recover chunks from an advance whose ingestion didn't commit before a crash.
     live = ingester.catch_up("events")
@@ -170,6 +178,7 @@ def run(settings: Settings, client: SimulatorClient, conn: sqlite3.Connection,
         changed = registry.refresh_changed()
         if changed:
             log.info("config changed for %s; snapshots refreshed", changed)
+        _tick_experiments(experiments)
         # Time is recorded only after its chunks are committed.
         _record_time(conn, result.sim_time, result.finished)
         log.info("advanced to %s: %d chunks, cumulative live events %d",

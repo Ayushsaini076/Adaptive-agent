@@ -215,6 +215,64 @@ MIGRATIONS: list[Migration] = [
     """,
     # 2: workflows, config/cohort snapshots, aggregates, baselines
     _m2_cohorts_and_metrics,
+    # 3: experiments
+    """
+    CREATE TABLE experiments (
+        experiment_id        TEXT PRIMARY KEY,   -- deterministic: wf/cohort/dim/cands/version
+        workflow_id          TEXT NOT NULL,
+        cohort_id            TEXT NOT NULL,
+        dimension            TEXT NOT NULL,
+        control              TEXT NOT NULL,
+        candidates           TEXT NOT NULL,      -- JSON list
+        primary_kpi          TEXT NOT NULL,
+        guardrail_kpi        TEXT NOT NULL,
+        guardrail_max_drop   REAL,
+        guardrail_relative   INTEGER NOT NULL,
+        alpha                REAL NOT NULL,
+        power                REAL NOT NULL,
+        mde                  REAL NOT NULL,
+        min_practical_uplift REAL NOT NULL,
+        n_per_arm            INTEGER NOT NULL,   -- primary-KPI units per arm
+        n_guardrail_per_arm  INTEGER NOT NULL,   -- guardrail units per arm (0 = no NI test)
+        max_duration_hours   REAL NOT NULL,
+        base_version         INTEGER NOT NULL,
+        allocation           TEXT NOT NULL,      -- JSON {option: share} under test
+        proposed_config      TEXT NOT NULL,      -- full config to make it live (M5)
+        design               TEXT NOT NULL,      -- JSON evidence behind the design
+        status               TEXT NOT NULL,
+        created_ts           TEXT NOT NULL,      -- simulated time
+        start_version        INTEGER,
+        start_ts             TEXT,
+        deadline_ts          TEXT,
+        decided_ts           TEXT,
+        decision             TEXT,               -- JSON, incl. per-arm tests
+        updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_experiments_wf_status ON experiments(workflow_id, status);
+
+    -- Append-only lifecycle log.
+    CREATE TABLE experiment_log (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        experiment_id TEXT NOT NULL,
+        sim_ts        TEXT NOT NULL,
+        from_status   TEXT,
+        to_status     TEXT NOT NULL,
+        detail        TEXT NOT NULL,
+        logged_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_experiment_log_exp ON experiment_log(experiment_id, id);
+
+    -- Per-arm counts used at decision time (first exposure per person).
+    CREATE TABLE experiment_evaluations (
+        experiment_id TEXT NOT NULL,
+        sim_ts        TEXT NOT NULL,
+        arm           TEXT NOT NULL,
+        kpi           TEXT NOT NULL,             -- 'primary' | 'guardrail'
+        num           INTEGER NOT NULL,
+        den           INTEGER NOT NULL,
+        PRIMARY KEY (experiment_id, sim_ts, arm, kpi)
+    );
+    """,
 ]
 
 

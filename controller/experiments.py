@@ -1,0 +1,622 @@
+"""Controlled experiments on one allocation dimension in one cohort.
+
+Lifecycle (persisted in ``experiments``; every transition in ``experiment_log``):
+
+    planned ──> running ──> decided   (winner | no_winner | guardrail_breach | inconclusive)
+       │           └──────> aborted   (allocation changed under us, e.g. supervisor edit)
+       └──────> cancelled            (base config changed before the design went live)
+
+M4 scope: plan, detect go-live, count exposures, decide. Getting a planned
+design live (approval / auto-apply) and promoting a winner are governance
+(M5); this module only produces the proposed config and the recommendation.
+
+Design rules (see README "Experiments" for the rationale):
+* One dimension at a time (welcome_message, then voice). caller_id is left
+  to caller-ID health (C5) so attributions don't mix. prompt_version is
+  workflow-wide and handled by the prompt-incident path (C8).
+* One cohort from the canonical cohort model; control = current dominant
+  option; 1..max_candidates untested options from the workflow's live
+  ``options``; equal traffic split, so control keeps 1/(k+1).
+* Sample size per arm from the historical baseline of the PRIMARY KPI,
+  powered for ``mde`` at ``power`` with alpha / k (Bonferroni for planning;
+  Holm at analysis is never less powerful).
+* Unit of analysis: one observation per person. Pickup uses each person's
+  first dial in the window; engagement uses each person's first CONNECTED
+  dial. The arm is the variant recorded ON THAT CALL. Repeat dials are
+  excluded from the test (still in operational KPIs).
+* Exposures only count from config versions whose allocation for
+  (cohort, dimension) equals the design, from go-live onwards.
+* Fixed horizon: the test runs ONCE, when every arm has n_per_arm units or
+  the deadline passes. Interim ticks only look at counts, never p-values,
+  so there is no peeking.
+* The guardrail is a non-inferiority test, so it is sized too: each arm also
+  needs enough GUARDRAIL units for the 95% lower bound to clear -tolerance
+  if the arms are truly equal. The primary n is raised when the guardrail
+  needs more (e.g. engagement guardrail only counts connected calls).
+* Winner = Holm-adjusted p <= alpha AND uplift >= min_practical_uplift AND
+  guardrail PASS. Among several, the highest lower CI bound wins.
+  Guardrail results are three-way: pass, breach (confidently worse than
+  tolerance), unverified (not enough evidence either way): unverified is
+  never promoted and never reported as a breach.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import sqlite3
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
+
+from controller import allocations as alloc
+from controller.cohorts import MIN_COHORT_SAMPLE
+from controller.database import get_state, set_state, transaction
+from controller.metrics import Rate
+from controller.stats import (
+    compare,
+    holm_adjust,
+    noninferiority_sample_size,
+    sample_size_per_arm,
+)
+from controller.workflows import Kpi, Workflow, WorkflowRegistry
+
+log = logging.getLogger(__name__)
+
+PLANNED, RUNNING, DECIDED, ABORTED, CANCELLED = (
+    "planned", "running", "decided", "aborted", "cancelled")
+ACTIVE = (PLANNED, RUNNING)
+TRANSITIONS = {PLANNED: {RUNNING, CANCELLED}, RUNNING: {DECIDED, ABORTED}}
+
+
+@dataclass(frozen=True)
+class ExperimentPolicy:
+    dimensions: tuple[str, ...] = ("welcome_message", "voice")
+    alpha: float = 0.05
+    power: float = 0.80
+    mde: float = 0.03                    # absolute uplift the design is powered to detect
+    min_practical_uplift: float = 0.01   # smallest uplift worth promoting
+    max_candidates: int = 2
+    max_duration_hours: float = 72.0     # deadline after go-live
+    next_campaign_ramp_hours: float = 24.0
+    replan_interval_hours: float = 6.0
+    promotion_holdout: float = 0.10      # control share kept after promotion
+    min_history_units: int = MIN_COHORT_SAMPLE
+
+
+# ----------------------------------------------------------------- time helpers
+
+
+def _dt(ts: str) -> datetime:
+    return datetime.fromisoformat(ts)
+
+
+def add_hours(ts: str, hours: float) -> str:
+    return (_dt(ts) + timedelta(hours=hours)).isoformat(timespec="seconds")
+
+
+def data_clock(conn: sqlite3.Connection, workflow_id: str) -> str | None:
+    """Latest call timestamp for the workflow: the controller's notion of 'now'
+    for that workflow, derived from data actually ingested."""
+    return conn.execute("SELECT MAX(ts) FROM calls WHERE workflow_id = ?",
+                        (workflow_id,)).fetchone()[0]
+
+
+# ----------------------------------------------------------------- exposures
+
+
+def first_exposures(conn: sqlite3.Connection, workflow_id: str, cohort_id: str, dim: str,
+                    kpi: Kpi, *, versions: list[int], start: str,
+                    end: str | None = None) -> dict[str, Rate]:
+    """Per-arm counts with ONE observation per person (see module docstring)."""
+    if dim not in alloc.ALLOCATION_DIMS:
+        raise ValueError(f"not an allocation dimension: {dim!r}")
+    if not versions:
+        return {}
+    qs = ",".join("?" * len(versions))
+    outcome = "connected" if kpi == "pickup" else "engaged"
+    only_connected = "AND connected = 1" if kpi == "engagement" else ""
+    sql = f"""
+        WITH f AS (
+            SELECT {dim} AS arm, {outcome} AS y,
+                   ROW_NUMBER() OVER (PARTITION BY COALESCE(person_id, lead_id)
+                                      ORDER BY event_id) AS rn
+            FROM calls
+            WHERE workflow_id = ? AND cohort_id = ? AND ts >= ? AND ts < ?
+              AND config_version IN ({qs}) {only_connected})
+        SELECT arm, COUNT(*), SUM(y) FROM f WHERE rn = 1 AND arm IS NOT NULL GROUP BY arm"""
+    rows = conn.execute(sql, (workflow_id, cohort_id, start, end or "9999",
+                              *versions)).fetchall()
+    return {arm: Rate(int(y or 0), int(n)) for arm, n, y in rows}
+
+
+def daily_units(conn: sqlite3.Connection, workflow_id: str, cohort_id: str, kpi: Kpi,
+                end: str) -> tuple[float, int]:
+    """Mean distinct persons per day (the test's unit) in history before ``end``.
+    Returns (units_per_day, total_units)."""
+    only_connected = "AND connected = 1" if kpi == "engagement" else ""
+    rows = conn.execute(
+        f"SELECT substr(ts, 1, 10) d, COUNT(DISTINCT COALESCE(person_id, lead_id)) "
+        f"FROM calls WHERE workflow_id = ? AND cohort_id = ? AND ts < ? {only_connected} "
+        f"GROUP BY d", (workflow_id, cohort_id, end)).fetchall()
+    if not rows:
+        return 0.0, 0
+    total = sum(r[1] for r in rows)
+    return total / len(rows), total
+
+
+# ----------------------------------------------------------------- planning
+
+
+@dataclass
+class Design:
+    experiment_id: str
+    workflow_id: str
+    cohort_id: str
+    dimension: str
+    control: str
+    candidates: list[str]
+    primary_kpi: Kpi
+    guardrail_kpi: Kpi
+    n_per_arm: int
+    n_guardrail_per_arm: int
+    base_version: int
+    allocation: dict[str, float]
+    proposed_config: dict
+    evidence: dict = field(default_factory=dict)
+
+
+def _tested(conn: sqlite3.Connection, wf: str, cohort: str, dim: str) -> set[str]:
+    """Options that actually received a statistical test in a decided experiment.
+
+    A candidate that was planned but under-exposed (or never exposed) is NOT
+    tested and may be planned again.
+    """
+    out: set[str] = set()
+    for (decision,) in conn.execute(
+            "SELECT decision FROM experiments WHERE workflow_id=? AND cohort_id=? "
+            "AND dimension=? AND status=?", (wf, cohort, dim, DECIDED)):
+        out.update((json.loads(decision or "{}").get("tests") or {}).keys())
+    return out
+
+
+def _history_end(conn: sqlite3.Connection, wf: str) -> str | None:
+    row = conn.execute("SELECT MAX(window_end) FROM baselines WHERE workflow_id=? AND "
+                       "label='history'", (wf,)).fetchone()
+    return row[0] if row else None
+
+
+def _baseline_rate(conn: sqlite3.Connection, wf: str, cohort: str, kpi: Kpi) -> Rate | None:
+    row = conn.execute("SELECT num, den FROM baselines WHERE workflow_id=? AND label='history' "
+                       "AND kpi=? AND cohort_id=?", (wf, kpi, cohort)).fetchone()
+    return Rate(row[0], row[1]) if row else None
+
+
+def _observed_control(conn: sqlite3.Connection, wf: str, cohort: str, dim: str,
+                      end: str) -> str | None:
+    row = conn.execute(
+        f"SELECT {dim}, COUNT(*) c FROM calls WHERE workflow_id=? AND cohort_id=? AND ts<? "
+        f"AND {dim} IS NOT NULL GROUP BY {dim} ORDER BY c DESC, {dim} LIMIT 1",
+        (wf, cohort, end)).fetchone()
+    return row[0] if row else None
+
+
+def plan(conn: sqlite3.Connection, registry: WorkflowRegistry, workflow_id: str,
+         policy: ExperimentPolicy = ExperimentPolicy()) -> tuple[Design | None, list[str]]:
+    """Deterministically pick the first feasible design, or explain why none.
+
+    Search order: dimensions in policy order; cohorts by descending historical
+    volume; most candidates first (fewer arms if the larger design can't
+    finish before the deadline).
+    """
+    reasons: list[str] = []
+    wf: Workflow = registry.get(workflow_id)
+    cfg = registry.config(workflow_id)
+    version = registry.current_version(workflow_id)
+    cohort_set = registry.cohort_set(workflow_id)
+    hist_end = _history_end(conn, workflow_id)
+    if cfg is None or version is None or cohort_set is None or hist_end is None:
+        return None, ["no config snapshot or history baseline yet"]
+    kpi, guard = wf.objective.primary, wf.objective.guardrail
+    ramp = policy.next_campaign_ramp_hours if wf.mid_flight == "next_campaign_only" else 0.0
+
+    volumes = []
+    for cohort in cohort_set.ids:
+        per_day, total = daily_units(conn, workflow_id, cohort, kpi, hist_end)
+        if total < policy.min_history_units:
+            reasons.append(f"{cohort}: {total} historical units < {policy.min_history_units}")
+            continue
+        volumes.append((per_day, total, cohort))
+    volumes.sort(key=lambda v: (-v[0], v[2]))
+
+    for dim in policy.dimensions:
+        opts = alloc.options(wf.meta, dim)
+        if len(opts) < 2:
+            reasons.append(f"{dim}: fewer than 2 options exposed")
+            continue
+        for per_day, total, cohort in volumes:
+            current = alloc.distribution(cfg, cohort, dim)
+            control = (max(sorted(current), key=current.get) if current
+                       else _observed_control(conn, workflow_id, cohort, dim, hist_end))
+            if control is None or control not in opts:
+                reasons.append(f"{dim}/{cohort}: control {control!r} not in options")
+                continue
+            done = _tested(conn, workflow_id, cohort, dim)
+            untested = [o for o in opts if o != control and o not in done]
+            if not untested:
+                reasons.append(f"{dim}/{cohort}: all options already tested")
+                continue
+            base = _baseline_rate(conn, workflow_id, cohort, kpi)
+            if base is None or not base.value or base.value >= 1:
+                reasons.append(f"{dim}/{cohort}: no usable {kpi} baseline")
+                continue
+            n_guard, g_ratio, g_base = _guardrail_sizing(
+                conn, wf, cohort, hist_end, per_day, policy)
+            for k in range(min(policy.max_candidates, len(untested)), 0, -1):
+                try:
+                    n_primary = sample_size_per_arm(base.value, policy.mde,
+                                                    alpha=policy.alpha / k, power=policy.power)
+                except ValueError as e:
+                    reasons.append(f"{dim}/{cohort}: {e}")
+                    break
+                if n_guard and not g_ratio:
+                    reasons.append(f"{dim}/{cohort}: no guardrail volume in history")
+                    break
+                n = max(n_primary, math.ceil(n_guard / g_ratio)) if n_guard else n_primary
+                hours = n * (k + 1) / per_day * 24 + ramp
+                if hours > policy.max_duration_hours:
+                    reasons.append(f"{dim}/{cohort}/k={k}: needs {n}/arm, ~{hours:.0f}h "
+                                   f"> {policy.max_duration_hours:.0f}h")
+                    continue
+                cands = untested[:k]
+                arms = [control, *cands]
+                split = {a: 1 / len(arms) for a in arms}
+                exp_id = f"exp:{workflow_id}:{cohort}:{dim}:{'+'.join(cands)}:v{version}"
+                design = Design(
+                    experiment_id=exp_id, workflow_id=workflow_id, cohort_id=cohort,
+                    dimension=dim, control=control, candidates=cands, primary_kpi=kpi,
+                    guardrail_kpi=guard, n_per_arm=n, n_guardrail_per_arm=n_guard,
+                    base_version=version, allocation=split,
+                    proposed_config=alloc.with_distribution(cfg, cohort, dim, split),
+                    evidence={
+                        "baseline": {"kpi": kpi, **base.as_dict(), "window_end": hist_end},
+                        "units_per_day": round(per_day, 1), "historical_units": total,
+                        "unit": ("first dial per person" if kpi == "pickup"
+                                 else "first connected dial per person"),
+                        "sizing": {"mde": policy.mde, "alpha_per_comparison": policy.alpha / k,
+                                   "power": policy.power, "n_primary": n_primary,
+                                   "n_guardrail": n_guard,
+                                   "guardrail_units_per_primary_unit": g_ratio,
+                                   "guardrail_baseline": g_base, "n_per_arm": n},
+                        "expected_hours": round(hours, 1), "ramp_hours": ramp,
+                        "mid_flight": wf.mid_flight,
+                        "current_distribution": current,
+                    })
+                return design, reasons
+    return None, reasons
+
+
+def _guardrail_sizing(conn: sqlite3.Connection, wf: Workflow, cohort: str, hist_end: str,
+                      primary_per_day: float, policy: ExperimentPolicy
+                      ) -> tuple[int, float, dict | None]:
+    """(guardrail units per arm, guardrail units per primary unit, baseline).
+
+    0 units when the workflow states no tolerance (then the guardrail check is
+    'no significant drop', which needs no dedicated sizing).
+    """
+    obj = wf.objective
+    g_base = _baseline_rate(conn, wf.workflow_id, cohort, obj.guardrail)
+    if obj.guardrail_max_drop is None or g_base is None or g_base.value is None:
+        return 0, 0.0, None
+    margin = obj.guardrail_max_drop * (g_base.value if obj.guardrail_relative else 1.0)
+    if margin <= 0:
+        return 0, 0.0, None
+    n = noninferiority_sample_size(g_base.value, margin, alpha=policy.alpha,
+                                   power=policy.power)
+    g_per_day, _ = daily_units(conn, wf.workflow_id, cohort, obj.guardrail, hist_end)
+    ratio = g_per_day / primary_per_day if primary_per_day else 0.0
+    return n, round(ratio, 4), {**g_base.as_dict(), "margin": round(margin, 4)}
+
+
+# ----------------------------------------------------------------- evaluation
+
+
+PASS, BREACH, UNVERIFIED = "pass", "breach", "unverified"
+
+
+@dataclass(frozen=True)
+class GuardrailCheck:
+    status: str                    # pass | breach | unverified
+    tolerance: float | None
+    comparison: dict | None
+    reason: str
+
+    @property
+    def passed(self) -> bool:
+        return self.status == PASS
+
+
+def guardrail_check(control: Rate, treatment: Rate, max_drop: float | None,
+                    relative: bool) -> GuardrailCheck:
+    """Non-inferiority on the guardrail KPI, with a 95% CI on (t - c).
+
+    With a tolerance:
+      pass       lower bound >= -tol   (confident the drop is within tolerance)
+      breach     upper bound <  -tol   (confident the drop exceeds tolerance)
+      unverified otherwise             (CI straddles -tol: not enough evidence)
+    Without a stated tolerance:
+      breach if upper bound < 0 (significant drop), else pass.
+    No guardrail observations at all => unverified.
+    """
+    c = compare(control, treatment)
+    if c is None:
+        return GuardrailCheck(UNVERIFIED, max_drop, None, "no guardrail observations")
+    lo, hi = c.ci
+    if max_drop is None:
+        status = BREACH if hi < 0 else PASS
+        why = f"no tolerance configured; 95% CI [{lo:+.4f}, {hi:+.4f}] vs 0"
+        return GuardrailCheck(status, None, c.as_dict(), why)
+    tol = max_drop * control.value if relative else max_drop
+    status = PASS if lo >= -tol else BREACH if hi < -tol else UNVERIFIED
+    why = f"95% CI [{lo:+.4f}, {hi:+.4f}] vs -{tol:.4f}"
+    return GuardrailCheck(status, tol, c.as_dict(), why)
+
+
+def decide(*, control: str, candidates: list[str], n_per_arm: int,
+           primary: dict[str, Rate], guardrail: dict[str, Rate], alpha: float,
+           min_practical_uplift: float, max_drop: float | None, relative: bool,
+           deadline_passed: bool) -> dict:
+    """Pure decision function. Same inputs -> same decision."""
+    empty = Rate(0, 0)
+    arms = {a: {"primary": primary.get(a, empty).as_dict(),
+                "guardrail": guardrail.get(a, empty).as_dict()} for a in [control, *candidates]}
+    exposed = [c for c in candidates if primary.get(c, empty).den >= n_per_arm]
+    under = [c for c in candidates if c not in exposed]
+    base = {"arms": arms, "n_per_arm": n_per_arm, "under_exposed": under,
+            "deadline_passed": deadline_passed}
+    if primary.get(control, empty).den < n_per_arm or not exposed:
+        return {**base, "outcome": "inconclusive", "winner": None,
+                "reason": "control or all candidates below the required sample"}
+
+    tests, pvals = {}, {}
+    for cand in candidates:   # under-exposed arms stay in the family with p = 1
+        cmp = compare(primary[control], primary[cand]) if cand in exposed else None
+        tests[cand] = cmp
+        pvals[cand] = cmp.p_value if cmp else 1.0
+    adjusted = holm_adjust(pvals)
+
+    results, winners, breaches, unverified = {}, [], [], []
+    for cand in exposed:
+        cmp = tests[cand]
+        significant = adjusted[cand] <= alpha and cmp.diff > 0
+        practical = cmp.diff >= min_practical_uplift
+        g = guardrail_check(guardrail.get(control, empty), guardrail.get(cand, empty),
+                            max_drop, relative)
+        results[cand] = {"primary": cmp.as_dict(), "holm_p": adjusted[cand],
+                         "significant": significant, "practical": practical,
+                         "guardrail": asdict(g)}
+        if significant and practical:
+            {PASS: winners, BREACH: breaches, UNVERIFIED: unverified}[g.status].append(cand)
+
+    base["tests"] = results
+    if winners:
+        best = max(winners, key=lambda c: (tests[c].ci[0], -candidates.index(c)))
+        return {**base, "outcome": "winner", "winner": best,
+                "reason": f"{best}: Holm p {adjusted[best]:.4g} <= {alpha}, uplift "
+                          f"{tests[best].diff:+.4f} >= {min_practical_uplift}, guardrail ok"}
+    if breaches:
+        return {**base, "outcome": "guardrail_breach", "winner": None,
+                "reason": f"significant primary uplift but guardrail breached: {breaches}"}
+    if unverified:
+        return {**base, "outcome": "guardrail_unverified", "winner": None,
+                "reason": f"significant primary uplift but guardrail not verifiable: "
+                          f"{unverified}"}
+    return {**base, "outcome": "no_winner", "winner": None,
+            "reason": "no candidate significant and practically meaningful"}
+
+
+# ----------------------------------------------------------------- persistence
+
+
+class ExperimentStore:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+
+    def create(self, d: Design, policy: ExperimentPolicy, wf: Workflow, now: str) -> bool:
+        """Insert a planned experiment. Returns False if the id already exists."""
+        obj = wf.objective
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO experiments(experiment_id, workflow_id, cohort_id, "
+            "dimension, control, candidates, primary_kpi, guardrail_kpi, guardrail_max_drop, "
+            "guardrail_relative, alpha, power, mde, min_practical_uplift, n_per_arm, "
+            "n_guardrail_per_arm, max_duration_hours, base_version, allocation, "
+            "proposed_config, design, status, created_ts) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (d.experiment_id, d.workflow_id, d.cohort_id, d.dimension, d.control,
+             json.dumps(d.candidates), d.primary_kpi, d.guardrail_kpi, obj.guardrail_max_drop,
+             int(obj.guardrail_relative), policy.alpha, policy.power, policy.mde,
+             policy.min_practical_uplift, d.n_per_arm, d.n_guardrail_per_arm,
+             policy.max_duration_hours,
+             d.base_version, json.dumps(d.allocation, sort_keys=True),
+             json.dumps(d.proposed_config, sort_keys=True), json.dumps(d.evidence),
+             PLANNED, now))
+        if cur.rowcount:
+            self._log(d.experiment_id, now, None, PLANNED, d.evidence)
+        return bool(cur.rowcount)
+
+    def transition(self, exp_id: str, to: str, now: str, detail: dict | None = None,
+                   **fields: object) -> None:
+        row = self.conn.execute("SELECT status FROM experiments WHERE experiment_id=?",
+                                (exp_id,)).fetchone()
+        if row is None:
+            raise KeyError(exp_id)
+        if to not in TRANSITIONS.get(row[0], set()):
+            raise ValueError(f"{exp_id}: illegal transition {row[0]} -> {to}")
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        self.conn.execute(
+            f"UPDATE experiments SET status = ?{', ' + sets if sets else ''}, "
+            f"updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE experiment_id = ?",
+            (to, *fields.values(), exp_id))
+        self._log(exp_id, now, row[0], to, detail)
+
+    def _log(self, exp_id: str, now: str, frm: str | None, to: str,
+             detail: dict | None) -> None:
+        self.conn.execute(
+            "INSERT INTO experiment_log(experiment_id, sim_ts, from_status, to_status, detail) "
+            "VALUES (?,?,?,?,?)", (exp_id, now, frm, to, json.dumps(detail or {})))
+
+    def active(self, workflow_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM experiments WHERE workflow_id=? AND status IN (?,?) "
+            "ORDER BY created_ts LIMIT 1", (workflow_id, *ACTIVE)).fetchone()
+
+    def get(self, exp_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM experiments WHERE experiment_id=?",
+                                 (exp_id,)).fetchone()
+
+
+# ----------------------------------------------------------------- manager
+
+
+class ExperimentManager:
+    """Drives the lifecycle once per tick. Every state change is one transaction."""
+
+    def __init__(self, conn: sqlite3.Connection, registry: WorkflowRegistry,
+                 policy: ExperimentPolicy = ExperimentPolicy()) -> None:
+        self.conn = conn
+        self.registry = registry
+        self.policy = policy
+        self.store = ExperimentStore(conn)
+
+    def tick(self) -> list[tuple[str, str]]:
+        """Advance every workflow's experiment by at most one step.
+        Returns (experiment_id, new_status) for each change."""
+        changes = []
+        for wf_id in self.registry.ids():
+            now = data_clock(self.conn, wf_id)
+            if now is None:
+                continue
+            exp = self.store.active(wf_id)
+            if exp is None:
+                new = self._maybe_plan(wf_id, now)
+            elif exp["status"] == PLANNED:
+                new = self._maybe_start_or_cancel(exp, now)
+            else:
+                new = self._maybe_abort_or_decide(exp, now)
+            if new:
+                changes.append(new)
+        return changes
+
+    # -- planned -----------------------------------------------------------
+
+    def _maybe_plan(self, wf_id: str, now: str) -> tuple[str, str] | None:
+        key = f"exp_plan_attempt:{wf_id}"
+        last = get_state(self.conn, key)
+        if last and _dt(now) < _dt(add_hours(last, self.policy.replan_interval_hours)):
+            return None
+        design, reasons = plan(self.conn, self.registry, wf_id, self.policy)
+        with transaction(self.conn):
+            set_state(self.conn, key, now)
+            if design is None:
+                log.info("%s: no feasible experiment: %s", wf_id, "; ".join(reasons[-5:]))
+                return None
+            if not self.store.create(design, self.policy, self.registry.get(wf_id), now):
+                return None
+        log.info("%s: planned %s (n=%d/arm, ~%sh)", wf_id, design.experiment_id,
+                 design.n_per_arm, design.evidence["expected_hours"])
+        return design.experiment_id, PLANNED
+
+    def _live_matches(self, exp: sqlite3.Row, version: int | None) -> bool:
+        cfg = self.registry.config(exp["workflow_id"], version)
+        if cfg is None:
+            return False
+        return alloc.same_distribution(
+            alloc.distribution(cfg, exp["cohort_id"], exp["dimension"]),
+            json.loads(exp["allocation"]))
+
+    def _maybe_start_or_cancel(self, exp: sqlite3.Row, now: str) -> tuple[str, str] | None:
+        version = self.registry.current_version(exp["workflow_id"])
+        if self._live_matches(exp, version):
+            with transaction(self.conn):
+                self.store.transition(
+                    exp["experiment_id"], RUNNING, now, {"start_version": version},
+                    start_version=version, start_ts=now,
+                    deadline_ts=add_hours(now, exp["max_duration_hours"]))
+            return exp["experiment_id"], RUNNING
+        if version != exp["base_version"]:
+            with transaction(self.conn):
+                self.store.transition(exp["experiment_id"], CANCELLED, now, {
+                    "reason": "base config changed before go-live",
+                    "base_version": exp["base_version"], "current_version": version})
+            return exp["experiment_id"], CANCELLED
+        return None   # waiting for governance (M5) to make it live
+
+    # -- running -------------------------------------------------------------
+
+    def eligible_versions(self, exp: sqlite3.Row) -> list[int]:
+        rows = self.conn.execute(
+            "SELECT version FROM workflow_config_snapshots WHERE workflow_id=? AND version>=? "
+            "ORDER BY version", (exp["workflow_id"], exp["start_version"])).fetchall()
+        return [r[0] for r in rows if self._live_matches(exp, r[0])]
+
+    def _maybe_abort_or_decide(self, exp: sqlite3.Row, now: str) -> tuple[str, str] | None:
+        exp_id = exp["experiment_id"]
+        if not self._live_matches(exp, self.registry.current_version(exp["workflow_id"])):
+            actor = self.conn.execute(
+                "SELECT actor, new_version FROM config_changes WHERE workflow_id=? "
+                "ORDER BY event_id DESC LIMIT 1", (exp["workflow_id"],)).fetchone()
+            with transaction(self.conn):
+                self.store.transition(exp_id, ABORTED, now, {
+                    "reason": "allocation under test changed",
+                    "changed_by": actor[0] if actor else None,
+                    "version": actor[1] if actor else None})
+            return exp_id, ABORTED
+
+        versions = self.eligible_versions(exp)
+        args = (self.conn, exp["workflow_id"], exp["cohort_id"], exp["dimension"])
+        primary = first_exposures(*args, exp["primary_kpi"], versions=versions,
+                                  start=exp["start_ts"])
+        guardrail = first_exposures(*args, exp["guardrail_kpi"], versions=versions,
+                                    start=exp["start_ts"])
+        candidates = json.loads(exp["candidates"])
+        arms = [exp["control"], *candidates]
+        empty = Rate(0, 0)
+        enough = all(primary.get(a, empty).den >= exp["n_per_arm"]
+                     and guardrail.get(a, empty).den >= exp["n_guardrail_per_arm"]
+                     for a in arms)
+        deadline_passed = _dt(now) >= _dt(exp["deadline_ts"])
+        if not (enough or deadline_passed):
+            return None   # interim ticks look at counts only, never at p-values
+        decision = decide(
+            control=exp["control"], candidates=candidates, n_per_arm=exp["n_per_arm"],
+            primary=primary, guardrail=guardrail, alpha=exp["alpha"],
+            min_practical_uplift=exp["min_practical_uplift"],
+            max_drop=exp["guardrail_max_drop"], relative=bool(exp["guardrail_relative"]),
+            deadline_passed=deadline_passed)
+        decision["evaluated_at"] = now
+        decision["versions"] = versions
+        decision["other_arms"] = sorted(set(primary) - set(arms))
+        if decision["outcome"] == "winner":
+            decision["recommendation"] = self._promotion(exp, decision["winner"])
+        with transaction(self.conn):
+            self.conn.executemany(
+                "INSERT INTO experiment_evaluations(experiment_id, sim_ts, arm, kpi, num, den) "
+                "VALUES (?,?,?,?,?,?)",
+                [(exp_id, now, arm, kpi, r.num, r.den)
+                 for kpi, counts in (("primary", primary), ("guardrail", guardrail))
+                 for arm, r in counts.items()])
+            self.store.transition(exp_id, DECIDED, now, {"outcome": decision["outcome"]},
+                                  decision=json.dumps(decision), decided_ts=now)
+        log.info("%s decided: %s (%s)", exp_id, decision["outcome"], decision["reason"])
+        return exp_id, DECIDED
+
+    def _promotion(self, exp: sqlite3.Row, winner: str) -> dict:
+        """Recommended (not applied) config: winner gets 1 - holdout, control keeps
+        the holdout so the effect can keep being measured for decay (C7)."""
+        h = self.policy.promotion_holdout
+        dist = {winner: 1 - h, exp["control"]: h} if h > 0 else {winner: 1.0}
+        cfg = self.registry.config(exp["workflow_id"]) or {}
+        return {"cohort_id": exp["cohort_id"], "dimension": exp["dimension"],
+                "allocation": dist, "holdout": h,
+                "proposed_config": alloc.with_distribution(cfg, exp["cohort_id"],
+                                                           exp["dimension"], dist)}
