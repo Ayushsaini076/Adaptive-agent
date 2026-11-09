@@ -30,7 +30,7 @@ def test_health_and_state(sim):
     with sim.client() as c:
         assert c.health() == {"status": "ok"}
         st = c.state()
-    assert st["sim_time"] == "D0 00:00"
+    assert st["ts"] == "2027-01-04T00:00:00+05:30" and st["sim_minute"] == 0
     assert st["credits_remaining"] == 100
 
 
@@ -40,7 +40,7 @@ def test_list_workflows_and_details(sim):
         assert ids == ["wf_a", "wf_b"]
         assert c.get_workflow("wf_b")["mid_flight"] == "next_campaign_only"
         assert c.get_config("wf_a")["version"] == 3
-        assert c.get_config_history("wf_a") == [sim.configs["wf_a"]]
+        assert c.get_config_history("wf_a")[0]["actor"] == "business_default"
 
 
 def test_list_workflows_accepts_wrapped_and_bare_ids():
@@ -116,7 +116,7 @@ def test_advance_returns_new_chunks_and_time(sim):
     with sim.client() as c:
         r = c.advance(60)
     assert r.new_chunks == [3]  # chunk numbers are global, after history 1-2
-    assert r.sim_time == "D0 01:00"
+    assert r.sim_time == "2027-01-04T01:00:00+05:30" and r.sim_minute == 60
     assert r.finished is False
     req = sim.requests[-1]
     assert req.method == "POST" and json.loads(req.content) == {"minutes": 60}
@@ -163,7 +163,7 @@ def test_advance_transport_error_not_retried():
 def test_get_retries_5xx_then_succeeds(sim):
     sim.faults["/sim/state"] = [httpx.Response(500), httpx.Response(502)]
     with sim.client(get_retries=3) as c:
-        assert c.state()["sim_time"] == "D0 00:00"
+        assert c.state()["sim_minute"] == 0
     assert len(sim.requests) == 3
 
 

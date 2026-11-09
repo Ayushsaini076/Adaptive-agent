@@ -130,6 +130,24 @@ class AdvanceResult:
     sim_time: str | None
     finished: bool
     raw: JSON = field(repr=False)
+    sim_minute: int | None = None
+
+
+# Keys the simulator uses for simulated time. Observed on /sim/state:
+# {"sim_minute": 0, "ts": "2027-01-04T00:00:00+05:30", ...}. Older aliases kept
+# as fallbacks.
+TIME_KEYS = ("ts", "sim_time", "current_time", "now", "time")
+
+
+def sim_clock(payload: JSON) -> tuple[str | None, int | None]:
+    """(timestamp, sim_minute) from a /sim/state or /sim/advance payload."""
+    ts = _first(payload, *TIME_KEYS)
+    minute = payload.get("sim_minute")
+    try:
+        minute = int(minute) if minute is not None else None
+    except (TypeError, ValueError):
+        minute = None
+    return (str(ts) if ts is not None else None), minute
 
 
 def _chunk_number(item: Any) -> int:
@@ -308,9 +326,11 @@ class SimulatorClient:
         if minutes <= 0 or minutes % TICK_MINUTES:
             raise ValueError(f"minutes must be a positive multiple of {TICK_MINUTES}")
         raw = self._send("POST", "/sim/advance", {"minutes": minutes})
+        ts, minute = sim_clock(raw)
         return AdvanceResult(
             new_chunks=_chunk_numbers(raw.get("new_chunks", [])),
-            sim_time=_first(raw, "sim_time", "current_time", "now", "time"),
+            sim_time=ts,
             finished=bool(raw.get("finished", False)),
             raw=raw,
+            sim_minute=minute,
         )

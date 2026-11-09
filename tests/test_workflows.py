@@ -75,3 +75,70 @@ def test_supervisor_change_refreshes_snapshot_and_keeps_old_version(sim, reg):
     src = reg.conn.execute("SELECT config FROM workflow_config_snapshots WHERE version=4"
                            ).fetchone()[0]
     assert json.loads(src)["prompt_version"] == "p2"
+
+
+# ---------------------------------------------------------------- F6: history = change records
+
+import logging  # noqa: E402
+
+from controller.workflows import history_config  # noqa: E402
+
+REAL_HISTORY_ENTRY = {"actor": "business_default", "applied_at": None, "approval_id": None,
+                      "changed_dims": [], "proposal_id": None, "version": 1}
+
+
+def test_history_change_record_is_not_config():
+    assert history_config(REAL_HISTORY_ENTRY) is None
+    assert history_config({"version": 2, "config": {"prompt_version": "p"}}) == {
+        "prompt_version": "p", "version": 2}
+    assert history_config({"version": 3, "allocations": {}})["version"] == 3
+
+
+def test_real_history_shape_does_not_shadow_current_config(sim, reg, caplog):
+    sim.config_history["wf_a"] = [{**REAL_HISTORY_ENTRY, "version": 3}]
+    with caplog.at_level(logging.ERROR):
+        reg.sync_all()
+        reg.refresh("wf_a")
+    assert "differs from the stored snapshot" not in caplog.text
+    cfg = reg.config("wf_a", 3)
+    assert cfg["prompt_version"] == "p1" and "actor" not in cfg
+    assert reg.cohort_set("wf_a", 3).ids == ["hi_t2", "default"]
+    row = reg.conn.execute("SELECT source, actor FROM workflow_config_snapshots "
+                           "WHERE workflow_id='wf_a' AND version=3").fetchone()
+    assert tuple(row) == ("api_current", "business_default")   # annotated, not replaced
+
+
+def test_change_record_for_unseen_version_creates_no_snapshot(sim, reg):
+    sim.config_history["wf_a"] = [{**REAL_HISTORY_ENTRY, "version": 1},
+                                  {**REAL_HISTORY_ENTRY, "version": 3}]
+    reg.sync_all()
+    versions = [r[0] for r in reg.conn.execute(
+        "SELECT version FROM workflow_config_snapshots WHERE workflow_id='wf_a'")]
+    assert versions == [3]          # v1's content was never observed: not invented
+
+
+def test_genuine_mismatch_logs_differing_keys(sim, reg, caplog):
+    reg.sync_all()
+    sim.configs["wf_a"] = {**sim.configs["wf_a"], "prompt_version": "TAMPERED"}
+    with caplog.at_level(logging.ERROR):
+        reg.refresh("wf_a")
+    assert "keys ['prompt_version']" in caplog.text
+
+
+# ---------------------------------------------------------------- F4: supervisor visibility
+
+
+def test_supervisor_edit_is_logged_as_warning(sim, reg, caplog):
+    reg.sync_all()
+    sim.event_chunks[10] = [sim.supervisor_edit("wf_a", prompt_version="p_bad")]
+    Ingester(reg.conn, sim.client()).ingest_chunk(10, "events")
+    with caplog.at_level(logging.WARNING):
+        reg.refresh_changed()
+    assert "supervisor edit: wf_a v4 changed [\"prompt_version\"]" in caplog.text
+    assert "not reverted" in caplog.text
+    assert [c["actor"] for c in reg.last_changes] == ["supervisor"]
+    reg.refresh_changed()
+    assert reg.last_changes == []
+    actor = reg.conn.execute("SELECT actor FROM workflow_config_snapshots "
+                             "WHERE workflow_id='wf_a' AND version=4").fetchone()[0]
+    assert actor == "supervisor"

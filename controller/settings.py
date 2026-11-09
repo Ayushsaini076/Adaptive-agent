@@ -17,7 +17,8 @@ class Settings:
     advance_minutes: int = 60
     http_timeout_s: float = 30.0
     http_get_retries: int = 3
-    db_path: str = "data/controller.db"
+    db_path: str | None = None        # explicit file; None = one file per scenario
+    db_dir: str = "data/worlds"       # where per-scenario files live when db_path is None
     log_level: str = "INFO"
 
     def __post_init__(self) -> None:
@@ -41,6 +42,7 @@ class Settings:
             advance_minutes=int(env.get("ADVANCE_MINUTES", "60")),
             http_timeout_s=float(env.get("HTTP_TIMEOUT_S", "30")),
             http_get_retries=int(env.get("HTTP_GET_RETRIES", "3")),
-            db_path=env.get("DB_PATH", "data/controller.db"),
+            db_path=env.get("DB_PATH") or None,
+            db_dir=env.get("DB_DIR", "data/worlds"),
             log_level=env.get("LOG_LEVEL", "INFO"),
         )

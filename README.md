@@ -37,6 +37,14 @@ KPI report from the controller's own database (no simulator needed):
 
 Settings come from environment variables; see `.env.example`.
 
+### Which database is used
+
+- **By default**, each scenario gets its own file: `data/worlds/<scenario>.db`, where the name comes from `/sim/state`.
+- **Controller restart:** it resumes the same file, because the simulator's `sim_minute` is at or ahead of the stored one.
+- **Simulator restart:** this is a new world, detected because `sim_minute` went backwards. The old file is **moved** to `data/worlds/<scenario>.<UTC timestamp>.db` (never deleted) and a fresh one is started. No operator action is needed.
+- **`DB_PATH` set:** that exact file is used. The controller **refuses to run** (exit code 3) if the file belongs to another world, rather than moving a file you chose.
+- **Backstops:** if `/sim/advance` reports a "new" chunk that is already stored, or an incoming event reuses a stored `event_id` with different content, the run stops with exit code 3 instead of silently skipping or dropping data.
+
 ## Test
 
 ```bash

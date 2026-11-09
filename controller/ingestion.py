@@ -48,6 +48,15 @@ INSERTS: dict[str, str] = {
 }
 
 
+class EventIdCollision(RuntimeError):
+    """An incoming event reuses a stored event_id with DIFFERENT content.
+
+    A true duplicate (same id, same payload) is safely ignored; a collision
+    means two different events share an id, which in practice means data from
+    two simulator worlds is being mixed. The chunk's transaction rolls back.
+    """
+
+
 @dataclass
 class ChunkResult:
     chunk_number: int
@@ -56,6 +65,7 @@ class ChunkResult:
     event_count: int = 0
     inserted: int = 0
     rejected: int = 0
+    duplicates: int = 0       # same event_id AND same payload as a stored event
     seconds: float = 0.0
 
 
@@ -65,17 +75,21 @@ class IngestStats:
     events: int = 0
     inserted: int = 0
     rejected: int = 0
+    duplicates: int = 0
+    skipped: int = 0
     seconds: float = 0.0
     results: list[ChunkResult] = field(default_factory=list)
 
     def add(self, r: ChunkResult) -> None:
         self.results.append(r)
         if r.skipped:
+            self.skipped += 1
             return
         self.chunks += 1
         self.events += r.event_count
         self.inserted += r.inserted
         self.rejected += r.rejected
+        self.duplicates += r.duplicates
         self.seconds += r.seconds
 
     @property
@@ -128,7 +142,7 @@ class Ingester:
 
     def ingest_chunk(self, chunk_number: int, kind: str) -> ChunkResult:
         if self.is_ingested(chunk_number):
-            log.debug("chunk %d already ingested; skipping", chunk_number)
+            log.info("chunk %d already ingested; skipping", chunk_number)
             return ChunkResult(chunk_number, kind, skipped=True)
 
         t0 = time.perf_counter()
@@ -172,10 +186,10 @@ class Ingester:
                     buffered += 1
 
                 if buffered >= self.batch_size:
-                    res.inserted += self._flush(buffers)
+                    self._flush(buffers, chunk_number, res)
                     buffered = 0
 
-            res.inserted += self._flush(buffers)
+            self._flush(buffers, chunk_number, res)
             update_aggregates_for_chunk(self.conn, chunk_number)
             self.conn.execute(
                 "INSERT INTO event_chunks(chunk_number, kind, event_count, inserted_count, "
@@ -191,6 +205,9 @@ class Ingester:
         if res.rejected:
             log.warning("chunk %d: %d/%d events rejected (see rejected_events)",
                         chunk_number, res.rejected, res.event_count)
+        if res.duplicates:
+            log.warning("chunk %d: %d/%d events were exact duplicates of stored events "
+                        "and were ignored", chunk_number, res.duplicates, res.event_count)
         log.debug("chunk %d (%s): %d events, %d new rows, %.3fs (total_changes +%d)",
                   chunk_number, kind, res.event_count, res.inserted, res.seconds,
                   self.conn.total_changes - before)
@@ -198,18 +215,52 @@ class Ingester:
 
     # ---------------------------------------------------------------- helpers
 
-    def _flush(self, buffers: dict[str, list[tuple]]) -> int:
-        """Write buffered rows. Returns how many NEW raw events were inserted."""
-        new_events = 0
+    def _flush(self, buffers: dict[str, list[tuple]], chunk_number: int,
+               res: ChunkResult) -> None:
+        """Write buffered rows, adding new-event and duplicate counts to ``res``.
+
+        ``events`` is flushed first (dict order), so a collision raises before
+        any projection rows of this batch are written; the caller's transaction
+        then rolls the whole chunk back.
+        """
         for table, rows in buffers.items():
             if not rows:
                 continue
             before = self.conn.total_changes
             self.conn.executemany(INSERTS[table], rows)
             if table == "events":
-                new_events = self.conn.total_changes - before
+                new = self.conn.total_changes - before
+                res.inserted += new
+                if new < len(rows):
+                    self._check_ignored(rows, chunk_number)   # raises on a collision
+                    res.duplicates += len(rows) - new
             rows.clear()
-        return new_events
+
+    def _check_ignored(self, rows: list[tuple], chunk_number: int) -> None:
+        """Every row INSERT OR IGNORE skipped must equal the stored event with that
+        id; raise EventIdCollision otherwise. Only runs when a batch had ignored
+        rows, so the normal path costs nothing."""
+        stored: dict[int, tuple[str, int]] = {}
+        ids = list({r[0] for r in rows})
+        for i in range(0, len(ids), 900):
+            part = ids[i:i + 900]
+            q = ",".join("?" * len(part))
+            for eid, payload, chunk in self.conn.execute(
+                    f"SELECT event_id, payload, chunk_number FROM events "
+                    f"WHERE event_id IN ({q})", part):
+                stored[eid] = (payload, chunk)
+        collisions = []
+        for row in rows:
+            eid, payload = row[0], row[6]
+            old_payload, old_chunk = stored[eid]
+            if old_payload != payload and json.loads(old_payload) != json.loads(payload):
+                collisions.append((eid, old_chunk))
+        if collisions:
+            eid, old_chunk = collisions[0]
+            raise EventIdCollision(
+                f"chunk {chunk_number}: {len(collisions)} event_id(s) already stored with "
+                f"different content (first: event {eid}, stored from chunk {old_chunk}). "
+                f"The database likely holds data from another simulator world.")
 
     def _state_int(self, key: str) -> str | None:
         row = self.conn.execute(

@@ -24,6 +24,32 @@ Kpi = Literal["pickup", "engagement"]
 KPIS: tuple[Kpi, ...] = ("pickup", "engagement")
 
 
+# Top-level keys that make a dict actual config content (vs a change record).
+CONFIG_CONTENT_KEYS = ("cohorts", "allocations", "prompt_version", "schedule")
+
+
+def history_config(item: Any) -> dict | None:
+    """Config content inside a /config/history entry, or None.
+
+    Observed entries are change records only:
+      {"version": 1, "actor": "business_default", "applied_at": null,
+       "changed_dims": [], "proposal_id": null, "approval_id": null}
+    Such a record must never be stored as the config of that version.
+    """
+    if not isinstance(item, dict):
+        return None
+    inner = item.get("config")
+    if isinstance(inner, dict):
+        cfg = inner
+    elif any(k in item for k in CONFIG_CONTENT_KEYS):
+        cfg = item
+    else:
+        return None
+    if config_version(cfg) is None and config_version(item) is not None:
+        cfg = {**cfg, "version": config_version(item)}
+    return cfg
+
+
 def _canon(v: Any) -> str:
     return json.dumps(v, sort_keys=True, separators=(",", ":"))
 
@@ -95,6 +121,7 @@ class WorkflowRegistry:
     def __init__(self, conn: sqlite3.Connection, client: SimulatorClient) -> None:
         self.conn = conn
         self.client = client
+        self.last_changes: list[dict] = []   # config_changed rows seen by the last refresh
 
     # ---------------------------------------------------------------- sync
 
@@ -122,12 +149,26 @@ class WorkflowRegistry:
                 "ON CONFLICT(workflow_id) DO UPDATE SET tenant_id=excluded.tenant_id, "
                 "metadata=excluded.metadata, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
                 (workflow_id, meta.get("tenant_id"), _canon(meta)))
-            for item in history:
-                cfg = item.get("config", item) if isinstance(item, dict) else None
-                if isinstance(cfg, dict):
-                    self._snapshot(workflow_id, cfg, item.get("actor"),
-                                   item.get("ts") or item.get("effective_at"), "api_history")
+            # GET /config is the authoritative content for the current version:
+            # snapshot it first so a history entry can never claim that version.
             self._snapshot(workflow_id, current, None, None, "api_current")
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                actor = item.get("actor")
+                ts = item.get("applied_at") or item.get("ts") or item.get("effective_at")
+                cfg = history_config(item)
+                if cfg is not None:
+                    self._snapshot(workflow_id, cfg, actor, ts, "api_history")
+                # Change-record fields only annotate an existing snapshot.
+                hv = config_version(item) if config_version(item) is not None else (
+                    config_version(cfg) if cfg else None)
+                if hv is not None:
+                    self.conn.execute(
+                        "UPDATE workflow_config_snapshots SET actor = COALESCE(actor, ?), "
+                        "effective_ts = COALESCE(effective_ts, ?) "
+                        "WHERE workflow_id = ? AND version = ?",
+                        (actor, ts, workflow_id, hv))
             v = config_version(current)
             set_state(self.conn, f"config_version:{workflow_id}", v)
         return v
@@ -135,15 +176,26 @@ class WorkflowRegistry:
     def refresh_changed(self) -> list[str]:
         """Refresh workflows that have new ``config_changed`` events since last sync."""
         last = int(get_state(self.conn, "config_sync_event_id", "0") or 0)
-        rows = self.conn.execute(
-            "SELECT workflow_id, MAX(event_id) FROM config_changes WHERE event_id > ? "
-            "GROUP BY workflow_id", (last,)).fetchall()
-        for wf_id, _ in rows:
+        changes = [dict(r) for r in self.conn.execute(
+            "SELECT event_id, ts, workflow_id, new_version, actor, changed_dims, proposal_id, "
+            "approval_id FROM config_changes WHERE event_id > ? ORDER BY event_id", (last,))]
+        self.last_changes = changes
+        for c in changes:
+            if c["actor"] == "supervisor":
+                log.warning("supervisor edit: %s v%s changed %s at %s (event %d); accepted as "
+                            "authoritative, not reverted", c["workflow_id"], c["new_version"],
+                            c["changed_dims"], c["ts"], c["event_id"])
+            else:
+                log.info("config change: %s v%s by %s changed %s (proposal %s, approval %s)",
+                         c["workflow_id"], c["new_version"], c["actor"], c["changed_dims"],
+                         c["proposal_id"], c["approval_id"])
+        changed = sorted({c["workflow_id"] for c in changes})
+        for wf_id in changed:
             self.refresh(wf_id)
-        if rows:
+        if changes:
             with transaction(self.conn):
-                set_state(self.conn, "config_sync_event_id", max(r[1] for r in rows))
-        return [r[0] for r in rows]
+                set_state(self.conn, "config_sync_event_id", changes[-1]["event_id"])
+        return changed
 
     def _snapshot(self, workflow_id: str, cfg: dict, actor: str | None,
                   ts: str | None, source: str) -> None:
@@ -161,8 +213,10 @@ class WorkflowRegistry:
                 "SELECT config FROM workflow_config_snapshots WHERE workflow_id=? AND version=?",
                 (workflow_id, v)).fetchone()[0]
             if existing != body:
-                log.error("config %s v%s changed content after snapshot; keeping first copy",
-                          workflow_id, v)
+                old = json.loads(existing)
+                keys = sorted(k for k in set(old) | set(cfg) if old.get(k) != cfg.get(k))
+                log.error("config %s v%s from %s differs from the stored snapshot in keys %s; "
+                          "keeping first copy", workflow_id, v, source, keys)
             return
         try:
             cs = CohortSet.from_config(workflow_id, cfg)

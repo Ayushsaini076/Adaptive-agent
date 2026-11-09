@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -16,6 +17,11 @@ import httpx
 from controller.client import SimulatorClient
 
 Handler = Callable[[httpx.Request], httpx.Response]
+
+
+def _change_record(version: int, actor: str, dims: list[str]) -> dict:
+    return {"version": version, "actor": actor, "applied_at": None, "approval_id": None,
+            "changed_dims": dims, "proposal_id": None}
 
 
 class BrokenStream(httpx.SyncByteStream):
@@ -85,15 +91,29 @@ class FakeSimulator:
     # chunk_number -> number of lines to serve before the stream breaks (one-shot)
     broken_chunks: dict[int, int] = field(default_factory=dict)
     next_event_id: int = 1000
+    # /config/history returns CHANGE RECORDS (no config content), as observed
+    # on the real simulator.
     config_history: dict[str, list[dict]] = field(default_factory=dict)
+    scenario: str = "fake_scenario"
+    advance_has_clock: bool = True   # False: advance response carries no time
 
     @property
     def finished(self) -> bool:
         return self.minute >= self.days * 1440
 
     def _sim_time(self) -> str:
-        d, rem = divmod(self.minute, 1440)
-        return f"D{d} {rem // 60:02d}:{rem % 60:02d}"
+        base = datetime.fromisoformat("2027-01-04T00:00:00+05:30")
+        return (base + timedelta(minutes=self.minute)).isoformat()
+
+    def restart(self) -> None:
+        """Simulator process restart: a NEW world with the same scenario."""
+        self.minute = 0
+        self.event_chunks = {}
+        self.next_event_id = 1000
+
+    def _history_records(self, wf: str) -> list[dict]:
+        return self.config_history.get(wf) or [_change_record(
+            self.configs[wf]["version"], "business_default", [])]
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -105,8 +125,12 @@ class FakeSimulator:
         if (m, path) == ("GET", "/health"):
             return httpx.Response(200, json={"status": "ok"})
         if (m, path) == ("GET", "/sim/state"):
-            return httpx.Response(200, json={"sim_time": self._sim_time(),
+            return httpx.Response(200, json={"scenario": self.scenario,
+                                             "sim_minute": self.minute,
+                                             "ts": self._sim_time(),
+                                             "end_minute": self.days * 1440,
                                              "finished": self.finished,
+                                             "tick_minutes": 15,
                                              "credits_remaining": self.credits})
         if (m, path) == ("POST", "/sim/advance"):
             minutes = json.loads(request.content)["minutes"]
@@ -119,8 +143,10 @@ class FakeSimulator:
             new = [n]
             self.event_chunks[n] = chunk_of_activity(self.next_event_id, f"camp{n}")
             self.next_event_id += 100
-            return httpx.Response(200, json={"new_chunks": new, "sim_time": self._sim_time(),
-                                             "finished": self.finished})
+            body = {"new_chunks": new, "finished": self.finished}
+            if self.advance_has_clock:
+                body |= {"sim_minute": self.minute, "ts": self._sim_time()}
+            return httpx.Response(200, json=body)
         if (m, path) == ("GET", "/workflows"):
             return httpx.Response(200, json=[{"workflow_id": w, **v}
                                              for w, v in self.workflows.items()])
@@ -133,7 +159,7 @@ class FakeSimulator:
             if parts[2:] == ["config"]:
                 return httpx.Response(200, json=self.configs[wf])
             if parts[2:] == ["config", "history"]:
-                return httpx.Response(200, json=self.config_history.get(wf, [self.configs[wf]]))
+                return httpx.Response(200, json=self._history_records(wf))
         if (m, path) == ("GET", "/events/chunks"):
             kind = request.url.params["kind"]
             after = int(request.url.params.get("after", -1))
@@ -157,7 +183,8 @@ class FakeSimulator:
         """Change a config the way a client supervisor would; returns the event."""
         old = self.configs[wf]
         new = {**old, **changes, "version": old["version"] + 1}
-        self.config_history.setdefault(wf, [old]).append(new)
+        self.config_history.setdefault(wf, self._history_records(wf)).append(
+            _change_record(new["version"], "supervisor", sorted(changes)))
         self.configs[wf] = new
         eid = self.next_event_id
         self.next_event_id += 1

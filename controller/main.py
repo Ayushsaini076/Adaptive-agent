@@ -22,13 +22,16 @@ import sys
 import time
 from dataclasses import dataclass
 
-from controller.client import ScenarioFinished, SimulatorClient, SimulatorError
-from controller.database import connect, set_state, transaction
+from collections import Counter
+
+from controller.client import ScenarioFinished, SimulatorClient, SimulatorError, sim_clock
+from controller.database import set_state, transaction
 from controller.experiments import ExperimentManager
-from controller.ingestion import Ingester, IngestStats
+from controller.ingestion import EventIdCollision, Ingester, IngestStats
 from controller.metrics import snapshot_baselines
 from controller.settings import Settings
 from controller.workflows import WorkflowRegistry
+from controller.world import WorldMismatch, open_world_db
 
 log = logging.getLogger("controller")
 
@@ -74,6 +77,7 @@ class RunSummary:
     advances: int = 0
     finished: bool = False
     sim_time: str | None = None
+    sim_minute: int | None = None
     history: IngestStats | None = None
     live: IngestStats | None = None
     wall_seconds: float = 0.0
@@ -84,10 +88,12 @@ class RunSummary:
             if st is None:
                 return None
             return {"chunks": st.chunks, "events": st.events, "inserted": st.inserted,
-                    "rejected": st.rejected, "ingest_seconds": round(st.seconds, 3),
+                    "rejected": st.rejected, "duplicates": st.duplicates,
+                    "skipped_chunks": st.skipped, "ingest_seconds": round(st.seconds, 3),
                     "events_per_sec": round(st.events_per_sec)}
         return {"workflows": self.workflows, "advances": self.advances, "finished": self.finished,
-                "sim_time": self.sim_time, "history": s(self.history),
+                "sim_time": self.sim_time, "sim_minute": self.sim_minute,
+                "history": s(self.history),
                 "live": s(self.live), "wall_seconds": round(self.wall_seconds, 3)}
 
 
@@ -125,10 +131,13 @@ def _tick_experiments(manager: ExperimentManager) -> None:
         log.info("experiment %s -> %s", exp_id, status)
 
 
-def _record_time(conn: sqlite3.Connection, sim_time: str | None, finished: bool) -> None:
+def _record_time(conn: sqlite3.Connection, sim_time: str | None, sim_minute: int | None,
+                 finished: bool) -> None:
     with transaction(conn):
         if sim_time is not None:
             set_state(conn, "sim_time", sim_time)
+        if sim_minute is not None:
+            set_state(conn, "sim_minute", sim_minute)
         set_state(conn, "finished", int(finished))
 
 
@@ -159,9 +168,9 @@ def run(settings: Settings, client: SimulatorClient, conn: sqlite3.Connection,
     summary.live = live
 
     summary.finished = bool(state.get("finished"))
-    summary.sim_time = state.get("sim_time")
+    summary.sim_time, summary.sim_minute = sim_clock(state)
     if bootstrap_only or summary.finished:
-        _record_time(conn, summary.sim_time, summary.finished)
+        _record_time(conn, summary.sim_time, summary.sim_minute, summary.finished)
         summary.wall_seconds = time.perf_counter() - t0
         return summary
 
@@ -172,17 +181,30 @@ def run(settings: Settings, client: SimulatorClient, conn: sqlite3.Connection,
             summary.finished = True
             break
         summary.advances += 1
-        summary.sim_time = result.sim_time
-        for r in ingester.ingest_many(result.new_chunks, "events").results:
+        sim_time, sim_minute = result.sim_time, result.sim_minute
+        if sim_time is None:   # advance response without a clock: ask /sim/state
+            sim_time, sim_minute = sim_clock(client.state())
+        summary.sim_time, summary.sim_minute = sim_time, sim_minute
+
+        # A chunk the simulator calls NEW that we already hold can only mean
+        # two worlds are mixed: stop instead of silently skipping it.
+        stale = [n for n in result.new_chunks if ingester.is_ingested(n)]
+        if stale:
+            raise WorldMismatch(
+                f"/sim/advance reported chunk(s) {stale} as new but they are already "
+                f"stored: this database belongs to a different simulator world")
+        step = ingester.ingest_many(result.new_chunks, "events")
+        for r in step.results:
             live.add(r)
-        changed = registry.refresh_changed()
-        if changed:
-            log.info("config changed for %s; snapshots refreshed", changed)
+        registry.refresh_changed()
         _tick_experiments(experiments)
         # Time is recorded only after its chunks are committed.
-        _record_time(conn, result.sim_time, result.finished)
-        log.info("advanced to %s: %d chunks, cumulative live events %d",
-                 result.sim_time, len(result.new_chunks), live.events)
+        _record_time(conn, sim_time, sim_minute, result.finished)
+        actors = Counter(c["actor"] or "unknown" for c in registry.last_changes)
+        log.info("advanced to %s (minute %s): %d chunks, %d events (%d new, %d duplicate, "
+                 "%d rejected); config changes %s; cumulative live events %d",
+                 sim_time, sim_minute, step.chunks, step.events, step.inserted,
+                 step.duplicates, step.rejected, dict(actors) or "none", live.events)
         if result.finished:
             summary.finished = True
             break
@@ -221,12 +243,15 @@ def main(argv: list[str] | None = None) -> int:
             if args.probe:
                 print(json.dumps(probe(client), indent=2, default=str))
                 return 0
-            conn = connect(settings.db_path)
+            conn, _ = open_world_db(settings, client.state())
             try:
                 summary = run(settings, client, conn, max_advances=args.max_advances,
                               bootstrap_only=args.bootstrap_only)
             finally:
                 conn.close()
+        except (WorldMismatch, EventIdCollision) as e:
+            log.error("world mismatch, stopping without changing anything: %s", e)
+            return 3
         except SimulatorError as e:
             log.error("simulator error: %s", e)
             return 1

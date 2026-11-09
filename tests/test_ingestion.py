@@ -105,3 +105,47 @@ def test_last_event_id_state_is_tracked(sim, conn):
     Ingester(conn, sim.client()).catch_up("history")
     v = conn.execute("SELECT value FROM controller_state WHERE key='last_event_id'").fetchone()
     assert v[0] == "106"
+
+
+# ---------------------------------------------------------------- F2: duplicates vs collisions
+
+import logging  # noqa: E402
+
+from controller.ingestion import EventIdCollision  # noqa: E402
+
+
+def test_identical_redelivery_counts_as_duplicate_and_warns(sim, conn, caplog):
+    ing = Ingester(conn, sim.client())
+    ing.catch_up("history")
+    sim.event_chunks[3] = chunk_of_activity(1, "hist1") + [call_event(50, "x", "hist1")]
+    with caplog.at_level(logging.WARNING):
+        r = ing.ingest_chunk(3, "events")
+    assert (r.event_count, r.inserted, r.duplicates) == (6, 1, 5)
+    assert "5/6 events were exact duplicates" in caplog.text
+
+
+def test_duplicate_within_one_chunk_is_counted(sim, conn):
+    e = call_event(70, "x", "c")
+    sim.history_chunks = {1: [e, e]}
+    r = Ingester(conn, sim.client()).ingest_chunk(1, "history")
+    assert (r.inserted, r.duplicates) == (1, 1)
+
+
+def test_same_id_different_content_is_a_collision_and_rolls_back(sim, conn):
+    """What actually happened: 144 events of a new world reused event_ids of
+    stored old-world events and were silently dropped."""
+    ing = Ingester(conn, sim.client())
+    ing.catch_up("history")                      # stores event ids 1..5
+    other_world = call_event(3, "someone_else", "other_campaign")
+    sim.event_chunks[3] = [call_event(60, "y", "c"), other_world]
+    with pytest.raises(EventIdCollision, match="event 3"):
+        ing.ingest_chunk(3, "events")
+    assert not ing.is_ingested(3)                # chunk rolled back entirely
+    assert conn.execute("SELECT COUNT(*) FROM events WHERE event_id = 60").fetchone()[0] == 0
+
+
+def test_skipped_chunks_are_counted(sim, conn):
+    ing = Ingester(conn, sim.client())
+    ing.ingest_chunk(1, "history")
+    stats = ing.ingest_many([1, 2], "history")
+    assert (stats.chunks, stats.skipped) == (1, 1)
