@@ -200,10 +200,18 @@ def approval_decision_row(raw: JSON, eid: int) -> tuple:
     )
 
 
+def approval_applied_row(raw: JSON, eid: int) -> tuple:
+    return (eid, event_ts(raw), _require(raw, "approval_id"), _get(raw, "workflow_id"),
+            _get(raw, "status", default="applied"),
+            _dumps({"proposal_id": _get(raw, "proposal_id"),
+                    "new_version": _get(raw, "new_version", "version")}))
+
+
 PROJECTIONS = {
     "campaign_created": ("campaigns", campaign_row),
     "lead": ("leads", lead_row),
     "call": ("calls", call_row),
     "config_changed": ("config_changes", config_change_row),
     "approval_decided": ("approval_decisions", approval_decision_row),
+    "approval_applied": ("approval_decisions", approval_applied_row),
 }

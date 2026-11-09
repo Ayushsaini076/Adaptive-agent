@@ -28,6 +28,28 @@ KPIS: tuple[Kpi, ...] = ("pickup", "engagement")
 CONFIG_CONTENT_KEYS = ("cohorts", "allocations", "prompt_version", "schedule")
 
 
+def split_config_response(resp: Any) -> tuple[dict | None, int | None]:
+    """(config content, version) from a GET /workflows/{id}/config response.
+
+    The simulator wraps the config: {"workflow_id", "version", "actor",
+    "applied_at", "config": {cohorts, allocations, prompt_version, schedule}}.
+    Only the inner content is a config: response metadata must never reach a
+    proposed_config (POST /approvals rejects unknown keys with 422). A flat
+    response (no ``config`` key) is reduced to the known content keys.
+    """
+    if not isinstance(resp, dict):
+        return None, None
+    inner = resp.get("config")
+    if isinstance(inner, dict):
+        content = {k: v for k, v in inner.items() if k != "version"}
+    else:
+        content = {k: resp[k] for k in CONFIG_CONTENT_KEYS if k in resp}
+    version = config_version(resp)
+    if version is None and isinstance(inner, dict):
+        version = config_version(inner)
+    return content, version
+
+
 def history_config(item: Any) -> dict | None:
     """Config content inside a /config/history entry, or None.
 
@@ -38,16 +60,11 @@ def history_config(item: Any) -> dict | None:
     """
     if not isinstance(item, dict):
         return None
-    inner = item.get("config")
-    if isinstance(inner, dict):
-        cfg = inner
-    elif any(k in item for k in CONFIG_CONTENT_KEYS):
-        cfg = item
-    else:
+    if not isinstance(item.get("config"), dict) and not any(k in item for k in
+                                                             CONFIG_CONTENT_KEYS):
         return None
-    if config_version(cfg) is None and config_version(item) is not None:
-        cfg = {**cfg, "version": config_version(item)}
-    return cfg
+    content, _ = split_config_response(item)
+    return content
 
 
 def _canon(v: Any) -> str:
@@ -151,25 +168,24 @@ class WorkflowRegistry:
                 (workflow_id, meta.get("tenant_id"), _canon(meta)))
             # GET /config is the authoritative content for the current version:
             # snapshot it first so a history entry can never claim that version.
-            self._snapshot(workflow_id, current, None, None, "api_current")
+            content, v = split_config_response(current)
+            self._snapshot(workflow_id, content, v, None, None, "api_current")
             for item in history:
                 if not isinstance(item, dict):
                     continue
                 actor = item.get("actor")
                 ts = item.get("applied_at") or item.get("ts") or item.get("effective_at")
                 cfg = history_config(item)
+                hv = split_config_response(item)[1]
                 if cfg is not None:
-                    self._snapshot(workflow_id, cfg, actor, ts, "api_history")
+                    self._snapshot(workflow_id, cfg, hv, actor, ts, "api_history")
                 # Change-record fields only annotate an existing snapshot.
-                hv = config_version(item) if config_version(item) is not None else (
-                    config_version(cfg) if cfg else None)
                 if hv is not None:
                     self.conn.execute(
                         "UPDATE workflow_config_snapshots SET actor = COALESCE(actor, ?), "
                         "effective_ts = COALESCE(effective_ts, ?) "
                         "WHERE workflow_id = ? AND version = ?",
                         (actor, ts, workflow_id, hv))
-            v = config_version(current)
             set_state(self.conn, f"config_version:{workflow_id}", v)
         return v
 
@@ -197,10 +213,10 @@ class WorkflowRegistry:
                 set_state(self.conn, "config_sync_event_id", changes[-1]["event_id"])
         return changed
 
-    def _snapshot(self, workflow_id: str, cfg: dict, actor: str | None,
+    def _snapshot(self, workflow_id: str, cfg: dict | None, v: int | None, actor: str | None,
                   ts: str | None, source: str) -> None:
-        v = config_version(cfg)
-        if v is None:
+        """Store config CONTENT for (workflow, version); the version is a column."""
+        if cfg is None or v is None:
             log.warning("config for %s has no version; not snapshotted", workflow_id)
             return
         body = _canon(cfg)
@@ -219,7 +235,7 @@ class WorkflowRegistry:
                           "keeping first copy", workflow_id, v, source, keys)
             return
         try:
-            cs = CohortSet.from_config(workflow_id, cfg)
+            cs = CohortSet.from_config(workflow_id, cfg, version=v)
         except ValueError as e:
             log.error("config %s v%s has invalid cohorts: %s", workflow_id, v, e)
             return
@@ -256,5 +272,7 @@ class WorkflowRegistry:
         return json.loads(row[0]) if row else None
 
     def cohort_set(self, workflow_id: str, version: int | None = None) -> CohortSet | None:
+        version = self.current_version(workflow_id) if version is None else version
         cfg = self.config(workflow_id, version)
-        return CohortSet.from_config(workflow_id, cfg) if cfg is not None else None
+        return (CohortSet.from_config(workflow_id, cfg, version=version)
+                if cfg is not None else None)

@@ -105,6 +105,8 @@ class FakeSimulator:
     pending_events: list[dict] = field(default_factory=list)
     applies: list[str] = field(default_factory=list)
     puts: list[dict] = field(default_factory=list)
+    invalid_requests: list[str] = field(default_factory=list)
+    fail_next_submit: int = 0          # simulate transport failures on POST /approvals
     # Optional generator replacing the default activity: (sim, first_minute,
     # last_minute) -> events. Lets a test dial with whatever config is LIVE.
     activity: Callable | None = None
@@ -163,6 +165,38 @@ class FakeSimulator:
                 if (oa.get(cohort) or {}).get(d) != (na.get(cohort) or {}).get(d):
                     dims.add(d)
         return sorted(dims)
+
+    CONFIG_KEYS = ("cohorts", "allocations", "prompt_version", "schedule")
+
+    def normalise_errors(self, wf: str, cfg) -> list[str]:
+        """Mirror of the simulator's config validation, as described by its contract."""
+        if not isinstance(cfg, dict):
+            return ["proposed_config must be an object"]
+        errors = [f"unknown key {k}" for k in sorted(set(cfg) - set(self.CONFIG_KEYS))]
+        opts = self.workflows[wf].get("options") or {}
+        alloc = cfg.get("allocations") or {}
+        default = alloc.get("default")
+        if not isinstance(default, dict):
+            errors.append("allocations.default is required")
+        else:
+            for dim in ("welcome_message", "voice", "caller_id"):
+                if dim not in default:
+                    errors.append(f"allocations.default.{dim} is required")
+        for cohort, dims in alloc.items():
+            for dim, dist in (dims or {}).items():
+                if not isinstance(dist, dict) or sum(float(x) for x in dist.values()) <= 0:
+                    errors.append(f"allocations.{cohort}.{dim}: weights must sum > 0")
+                    continue
+                if any(float(x) < 0 for x in dist.values()):
+                    errors.append(f"allocations.{cohort}.{dim}: negative weight")
+                allowed = opts.get(dim)
+                if allowed and set(dist) - set(allowed):
+                    errors.append(f"allocations.{cohort}.{dim}: {sorted(set(dist) - set(allowed))} "
+                                  f"not in options")
+        pv_opts = opts.get("prompt_version")
+        if pv_opts and cfg.get("prompt_version") not in pv_opts:
+            errors.append(f"prompt_version {cfg.get('prompt_version')} not in options")
+        return errors
 
     def flush_events(self) -> int | None:
         """Put pending events into a new chunk now (tests that don't advance)."""
@@ -259,6 +293,12 @@ class FakeSimulator:
                 "n": body["n"]})
         if (m, path) == ("POST", "/approvals"):
             body = json.loads(request.content)
+            if self.fail_next_submit:
+                self.fail_next_submit -= 1
+                aid = f"apr_{len(self.approvals) + 1}"        # request reached the server ...
+                self.approvals[aid] = {"approval_id": aid, "status": "pending",
+                                       "submitted_minute": self.minute, **body}
+                raise httpx.ReadTimeout("response lost", request=request)   # ... reply lost
             if any(a["proposal_id"] == body["proposal_id"] for a in self.approvals.values()):
                 return httpx.Response(409, json={"detail": "duplicate_proposal_id"})
             for k in ("proposal_id", "workflow_id", "base_version", "proposed_config",
@@ -267,6 +307,10 @@ class FakeSimulator:
                     return httpx.Response(422, json={"detail": f"missing {k}"})
             if not 0 <= body.get("impact_score", -1) <= 1 or body.get("affected_leads", -1) < 0:
                 return httpx.Response(422, json={"detail": "bad impact/affected_leads"})
+            errs = self.normalise_errors(body["workflow_id"], body["proposed_config"])
+            if errs:
+                self.invalid_requests.append(body["proposal_id"])
+                return httpx.Response(422, json={"detail": errs})
             aid = f"apr_{len(self.approvals) + 1}"
             self.approvals[aid] = {"approval_id": aid, "status": "pending",
                                    "submitted_minute": self.minute, **body}
@@ -298,11 +342,17 @@ class FakeSimulator:
                                    self._dims(self.configs[wf], a["proposed_config"]),
                                    a["proposal_id"], aid)
             a["status"] = "applied"
+            self._event(type="approval_applied", approval_id=aid, workflow_id=wf,
+                        proposal_id=a["proposal_id"], new_version=new["version"],
+                        status="applied")
             self.applies.append(aid)
             return httpx.Response(200, json={"version": new["version"]})
         if m == "PUT" and parts[0] == "workflows" and parts[2:] == ["config"]:
             wf, body = parts[1], json.loads(request.content)
             self.puts.append(body)
+            errs = self.normalise_errors(wf, body.get("proposed_config"))
+            if errs:
+                return httpx.Response(422, json={"detail": errs})
             aa = (self.workflows[wf].get("governance") or {}).get("auto_apply") or {}
             dims = self._dims(self.configs[wf], body["proposed_config"])
             if not aa.get("enabled") or set(dims) - set(aa.get("allowed_dims") or []):
@@ -322,7 +372,14 @@ class FakeSimulator:
             if len(parts) == 2:
                 return httpx.Response(200, json={"workflow_id": wf, **self.workflows[wf]})
             if parts[2:] == ["config"]:
-                return httpx.Response(200, json=self.configs[wf])
+                # Real shape: metadata envelope around the config content.
+                cfg = self.configs[wf]
+                last = (self.config_history.get(wf) or [{}])[-1]
+                return httpx.Response(200, json={
+                    "workflow_id": wf, "version": cfg["version"],
+                    "actor": last.get("actor", "business_default"),
+                    "applied_at": last.get("applied_at"),
+                    "config": {k: v for k, v in cfg.items() if k != "version"}})
             if parts[2:] == ["config", "history"]:
                 return httpx.Response(200, json=self._history_records(wf))
         if (m, path) == ("GET", "/events/chunks"):

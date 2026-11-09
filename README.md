@@ -194,6 +194,22 @@ One bad call, a small sample, a single bad hour or a mild dip never triggers it.
 - Every step writes `audit_log` plus a `GOVERNANCE` WARNING line.
 - The parsed policy of every workflow is logged at startup.
 
+**Config content vs metadata.** `GET /workflows/{id}/config` returns an envelope (`workflow_id`, `version`, `actor`, `applied_at`, `config`). Only the inner `config` is stored and used, and the version is kept separately (`split_config_response` in `workflows.py`). A `proposed_config` therefore contains only `cohorts`, `allocations`, `prompt_version` and `schedule`.
+
+**Before sending,** every proposed config is checked against the simulator's rules: the four keys only; `allocations.default` with `welcome_message`, `voice` and `caller_id`; weights ≥ 0 that sum to more than 0; values in `options`; cohort allocations only for defined cohorts. A failing check is logged and never sent.
+
+**Submission outcomes:**
+
+| Response | What the controller does |
+|---|---|
+| 422 / 400 | Recorded as `invalid`, with the simulator's details in an ERROR log and the proposal row. The identical payload is never resent; a new attempt happens only once the change or the base config differs. |
+| 403 | Recorded as `refused`. For auto-apply, the same change goes through the approval route instead. |
+| 409 stale | The config is refreshed and the proposal rebuilt from it, so a supervisor's newer edit is never overwritten. |
+| 409 duplicate | The existing approval is adopted. |
+| Timeout / 5xx | Recorded as `unconfirmed`. The next tick adopts the remote approval by `proposal_id`, or resends the **same** payload. |
+
+`approval_applied` events are stored with `approval_decided` in `approval_decisions`.
+
 **Every proposal carries** a stable `proposal_id`, the exact `base_version`, the full config, a summary, a diff with per-cohort TV shift, `affected_leads` (with its basis), a dry run built from observed data, an `impact_score`, and a rationale. Impact score = `min(1, |expected pp| / 5) × traffic share changed × confidence` (0.9 measured, 0.5 rollback, 0.3 exploratory); the inputs are kept in the dry run.
 
 **Audit query:**

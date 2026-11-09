@@ -90,8 +90,8 @@ REAL_HISTORY_ENTRY = {"actor": "business_default", "applied_at": None, "approval
 def test_history_change_record_is_not_config():
     assert history_config(REAL_HISTORY_ENTRY) is None
     assert history_config({"version": 2, "config": {"prompt_version": "p"}}) == {
-        "prompt_version": "p", "version": 2}
-    assert history_config({"version": 3, "allocations": {}})["version"] == 3
+        "prompt_version": "p"}                          # content only; version is separate
+    assert history_config({"version": 3, "allocations": {}, "actor": "x"}) == {"allocations": {}}
 
 
 def test_real_history_shape_does_not_shadow_current_config(sim, reg, caplog):

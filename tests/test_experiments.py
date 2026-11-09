@@ -544,7 +544,6 @@ def test_proposed_config_never_dials_caller_id_with_open_incident(w):
         "evidence, mitigation) VALUES ('i1','caller_id_health','wf','c_bad','detected',"
         "'2027-01-04T10:00:00+05:30','{}','{}')")
     cfg = w.reg.config("wf")
-    w.sim.configs["wf"] = {**cfg, "version": cfg["version"]}
     w.reg.conn.execute("UPDATE workflow_config_snapshots SET config=? WHERE workflow_id='wf'",
                        (json.dumps({**cfg, "allocations": {**cfg["allocations"], "default": {
                            **cfg["allocations"]["default"],

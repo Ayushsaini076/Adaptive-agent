@@ -102,14 +102,16 @@ class CohortSet:
             raise CohortError(f"duplicate cohort ids: {ids}")
 
     @classmethod
-    def from_config(cls, workflow_id: str, config: Mapping[str, Any]) -> "CohortSet":
+    def from_config(cls, workflow_id: str, config: Mapping[str, Any],
+                    version: int | None = None) -> "CohortSet":
         raw = config.get("cohorts") or []
         if isinstance(raw, Mapping):  # {"id": {where...}} form
             raw = [{"cohort_id": k, **({"where": v} if "where" not in v else v)}
                    for k, v in raw.items()]
         cohorts = tuple(Cohort.from_dict(c, i) for i, c in enumerate(raw)
                         if (c.get("cohort_id") or c.get("id") or c.get("name")) != DEFAULT)
-        return cls(workflow_id, config_version(config), cohorts)
+        return cls(workflow_id, version if version is not None else config_version(config),
+                   cohorts)
 
     @property
     def ids(self) -> list[str]:

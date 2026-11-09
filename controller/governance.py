@@ -46,9 +46,10 @@ from controller.client import (
     Lapsed,
     SimulatorClient,
     SimulatorError,
+    SimulatorUnavailable,
     StaleBaseVersion,
 )
-from controller.cohorts import config_version
+from controller.cohorts import CohortSet, config_version
 from controller.database import get_state, set_state, transaction
 from controller.incidents import (
     DETECTED,
@@ -63,6 +64,14 @@ from controller.workflows import WorkflowRegistry
 log = logging.getLogger(__name__)
 
 IN_FLIGHT = ("pending", "approved")
+UNCONFIRMED = "unconfirmed"     # sent, but the reply was lost: may or may not exist remotely
+CONFIG_CONTENT_KEYS = ("cohorts", "allocations", "prompt_version", "schedule")
+REQUIRED_DEFAULT_DIMS = ("welcome_message", "voice", "caller_id")
+
+
+def payload_hash(base_version: int, proposed_config: dict) -> str:
+    return hashlib.sha1(json.dumps([base_version, proposed_config], sort_keys=True)
+                        .encode()).hexdigest()[:16]
 RETRYABLE = ("expired", "lapsed", "stale", "failed")
 MAX_ATTEMPTS = 3
 
@@ -132,13 +141,13 @@ class GovernanceManager:
 
     def _in_flight(self, wf: str) -> bool:
         return self.conn.execute(
-            "SELECT 1 FROM proposals WHERE workflow_id=? AND status IN (?,?)",
-            (wf, *IN_FLIGHT)).fetchone() is not None
+            "SELECT 1 FROM proposals WHERE workflow_id=? AND status IN (?,?,?)",
+            (wf, *IN_FLIGHT, UNCONFIRMED)).fetchone() is not None
 
     # ---------------------------------------------------------------- reconcile
 
     def reconcile(self, now: str) -> list[tuple[str, str]]:
-        changes = []
+        changes = self._resolve_unconfirmed(now)
         rows = self.conn.execute(
             "SELECT * FROM proposals WHERE status IN (?,?) AND route='approval' "
             "ORDER BY submitted_ts", IN_FLIGHT).fetchall()
@@ -460,7 +469,14 @@ class GovernanceManager:
             self._defer(wf, now, "invalid proposal: " + "; ".join(problems), chosen)
             return None
 
+        h = payload_hash(base_version, proposed)
+        if get_state(self.conn, f"rejected_payload:{wf}") == h:
+            self._defer(wf, now, "identical to a payload the simulator rejected (422/403); "
+                        "not resubmitting until the change or the base config differs", chosen)
+            return None
         auto_ok, auto_why = policy.auto_apply_check(current, proposed, dims)
+        if auto_ok and get_state(self.conn, f"auto_refused:{wf}") == h:
+            auto_ok, auto_why = False, ["simulator refused auto-apply of this change (403)"]
         route = "auto" if auto_ok else "approval"
         if route == "approval":
             sent = self.conn.execute(
@@ -480,7 +496,7 @@ class GovernanceManager:
     def validate(self, wf: str, current: dict, proposed: dict, dims: list[str],
                  policy: GovernancePolicy, evidence: dict | None = None) -> list[str]:
         meta = self.registry.get(wf).meta
-        problems = []
+        problems = self.contract_problems(wf, proposed)
         for cohort, dim, _ in impact.allocation_shifts(current, proposed):
             allowed = set(alloc.options(meta, dim))
             bad = set(alloc.distribution(proposed, cohort, dim)) - allowed
@@ -500,6 +516,45 @@ class GovernanceManager:
                 problems.append("prompt change without validation evidence")
             elif need is not None and (v.get("pass_rate") or 0) < need:
                 problems.append(f"validation pass rate {v.get('pass_rate')} < {need}")
+        return problems
+
+    def contract_problems(self, wf: str, cfg: dict) -> list[str]:
+        """The simulator's proposed_config rules, checked BEFORE sending: only the
+        four content keys; allocations.default with all three dimensions; every
+        distribution non-empty with non-negative weights summing > 0; values in
+        options; cohort-specific allocations only for defined cohorts."""
+        problems = [f"proposed_config has non-config key {k!r}"
+                    for k in sorted(set(cfg) - set(CONFIG_CONTENT_KEYS))]
+        allocs = cfg.get("allocations")
+        default = allocs.get("default") if isinstance(allocs, dict) else None
+        if not isinstance(default, dict):
+            problems.append("allocations.default is required")
+        else:
+            problems += [f"allocations.default.{d} is required"
+                         for d in REQUIRED_DEFAULT_DIMS if d not in default]
+        cohort_ids = {c.cohort_id for c in CohortSet.from_config(wf, cfg).cohorts} \
+            if not problems else set()
+        meta = self.registry.get(wf).meta
+        for cohort, dims_ in (allocs or {}).items() if isinstance(allocs, dict) else []:
+            if cohort != "default" and cohort_ids and cohort not in cohort_ids:
+                problems.append(f"allocations.{cohort}: cohort not defined in cohorts")
+            for dim, dist in (dims_ or {}).items():
+                try:
+                    weights = [float(x) for x in (dist.values() if isinstance(dist, dict)
+                                                  else [])]
+                except (TypeError, ValueError):
+                    weights = []
+                if not weights or sum(weights) <= 0 or min(weights) < 0:
+                    problems.append(f"allocations.{cohort}.{dim}: weights must be >= 0 and "
+                                    f"sum > 0")
+                    continue
+                allowed = alloc.options(meta, dim)
+                if allowed and set(dist) - set(allowed):
+                    problems.append(f"allocations.{cohort}.{dim}: "
+                                    f"{sorted(set(dist) - set(allowed))} not in options")
+        pv_opts = alloc.options(meta, "prompt_version") or alloc.options(meta, "prompt")
+        if pv_opts and cfg.get("prompt_version") not in pv_opts:
+            problems.append(f"prompt_version {cfg.get('prompt_version')!r} not in options")
         return problems
 
     def _payload(self, wf, now, base_version, current, proposed, dims, chosen, policy,
@@ -549,54 +604,90 @@ class GovernanceManager:
             "expires_in_hours": policy.proposal_ttl_hours,
         }
 
+    def _send(self, wf: str, route: str, payload: dict) -> tuple[str | None, str, str | None]:
+        """One HTTP attempt. Returns (approval_id, status, apply_by)."""
+        if route == "auto":
+            self.client.put_config(wf, payload)
+            return None, "auto_applied", None
+        try:
+            resp = self.client.submit_approval(payload)
+        except Conflict as e:
+            if isinstance(e, StaleBaseVersion) or "stale" in (e.code or "").lower():
+                raise
+            # 409 duplicate proposal_id: it exists remotely; adopt it, never re-create.
+            resp = next((a for a in self.client.list_approvals(wf)
+                         if a.get("proposal_id") == payload["proposal_id"]), None)
+            if resp is None:
+                raise
+        return (resp.get("approval_id") or resp.get("id"),
+                str(resp.get("status", "pending")).lower(), resp.get("apply_by"))
+
     def _submit(self, wf, now, route, payload, chosen) -> tuple[str, str] | None:
         pid = payload["proposal_id"]
-        intents = json.dumps([{"kind": i.kind, "ref": i.ref} for i in chosen])
-        approval_id, status, apply_by = None, None, None
+        intents = [{"kind": i.kind, "ref": i.ref} for i in chosen]
         try:
-            if route == "auto":
-                resp = self.client.put_config(wf, payload)
-                status = "auto_applied"
-            else:
-                try:
-                    resp = self.client.submit_approval(payload)
-                except Conflict as e:
-                    if "stale" in (e.code or "").lower():
-                        raise
-                    resp = next((a for a in self.client.list_approvals(wf)
-                                 if a.get("proposal_id") == pid), None)
-                    if resp is None:
-                        raise
-                approval_id = resp.get("approval_id") or resp.get("id")
-                status = str(resp.get("status", "pending")).lower()
-                apply_by = resp.get("apply_by")
+            approval_id, status, apply_by = self._send(wf, route, payload)
         except StaleBaseVersion as e:
             self.registry.refresh(wf)
-            log.warning("GOVERNANCE %s not sent: base v%s already stale (%s)", pid,
-                        payload["base_version"], e)
+            log.warning("GOVERNANCE %s not sent: base v%s already stale (%s); will rebuild from "
+                        "the new config", pid, payload["base_version"], e)
             return None
+        except SimulatorUnavailable as e:
+            # Timeout / connection reset / 5xx: the request may have been stored.
+            # Keep the SAME proposal_id and payload; reconcile adopts or resends it.
+            self._record(wf, pid, intents, route, payload, UNCONFIRMED, now, reasons=str(e))
+            log.warning("GOVERNANCE %s outcome unknown (%s); will reconcile by proposal_id",
+                        pid, e)
+            return pid, UNCONFIRMED
         except SimulatorError as e:
-            if route == "auto" and (e.status or 0) < 500:
-                log.warning("GOVERNANCE auto-apply of %s refused (%s); falling back to approval",
-                            pid, e)
-                self._defer(wf, now, f"auto-apply refused by simulator: {e}", chosen)
-                return None
-            log.error("GOVERNANCE %s submit failed: %s", pid, e)
-            return None
+            return self._rejected(wf, pid, intents, route, payload, now, e)
+        self._record(wf, pid, intents, route, payload, status, now, approval_id, apply_by)
+        return self._after_send(wf, pid, route, payload, status, approval_id, now)
 
+    def _rejected(self, wf, pid, intents, route, payload, now, e) -> tuple[str, str] | None:
+        h = payload_hash(payload["base_version"], payload["proposed_config"])
+        if e.status in (400, 422):
+            status = "invalid"
+            with transaction(self.conn):
+                set_state(self.conn, f"rejected_payload:{wf}", h)
+            log.error("GOVERNANCE %s REJECTED AS INVALID by %s (HTTP %s): %s; payload kept in "
+                      "proposals for diagnosis and will NOT be resubmitted unchanged", pid,
+                      "PUT /config" if route == "auto" else "POST /approvals", e.status,
+                      json.dumps(e.body, default=str)[:1000])
+        elif e.status == 403:
+            status = "refused"
+            key = "auto_refused" if route == "auto" else "rejected_payload"
+            with transaction(self.conn):
+                set_state(self.conn, f"{key}:{wf}", h)
+            log.warning("GOVERNANCE %s refused by simulator policy (403): %s%s", pid, e.body,
+                        "; will use the approval route instead" if route == "auto" else "")
+        else:
+            log.error("GOVERNANCE %s submit failed (HTTP %s): %s", pid, e.status, e)
+            return None
+        self._record(wf, pid, intents, route, payload, status, now,
+                     reasons={"http_status": e.status, "body": e.body})
+        return pid, status
+
+    def _record(self, wf, pid, intents, route, payload, status, now, approval_id=None,
+                apply_by=None, reasons=None) -> None:
+        action = {"pending": "submitted", "approved": "submitted"}.get(status, status)
         with transaction(self.conn):
             self.conn.execute(
                 "INSERT INTO proposals(proposal_id, workflow_id, intents, route, base_version, "
-                "payload, status, approval_id, apply_by, submitted_ts) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (pid, wf, intents, route, payload["base_version"], json.dumps(payload), status,
-                 approval_id, apply_by, now))
-            self.audit(wf, f"proposal_{'auto_applied' if route == 'auto' else 'submitted'}", pid,
-                       {"route": route, "intents": json.loads(intents),
+                "payload, status, approval_id, apply_by, submitted_ts, reasons) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (pid, wf, json.dumps(intents), route, payload["base_version"],
+                 json.dumps(payload), status, approval_id, apply_by, now,
+                 json.dumps(reasons, default=str) if reasons is not None else None))
+            self.audit(wf, f"proposal_{action}", pid,
+                       {"route": route, "intents": intents,
                         "base_version": payload["base_version"],
                         "change_summary": payload["change_summary"], "diff": payload["diff"],
                         "impact_score": payload["impact_score"],
                         "affected_leads": payload["affected_leads"],
-                        "approval_id": approval_id}, now)
+                        "approval_id": approval_id, "reasons": reasons}, now)
+
+    def _after_send(self, wf, pid, route, payload, status, approval_id, now):
         log.warning("GOVERNANCE %s %s for %s: %s (impact %.3f, affected leads ~%d)", pid,
                     "AUTO-APPLIED" if route == "auto" else f"submitted for approval {approval_id}",
                     wf, payload["change_summary"], payload["impact_score"],
@@ -606,6 +697,55 @@ class GovernanceManager:
             p = self.conn.execute("SELECT * FROM proposals WHERE proposal_id=?", (pid,)).fetchone()
             self._on_applied(p, self.registry.current_version(wf), now)
         return pid, status
+
+    def _resolve_unconfirmed(self, now: str) -> list[tuple[str, str]]:
+        """Requests whose reply was lost: adopt the remote record if it exists,
+        otherwise resend the SAME payload (same proposal_id = idempotent)."""
+        changes = []
+        for p in self.conn.execute("SELECT * FROM proposals WHERE status=?",
+                                   (UNCONFIRMED,)).fetchall():
+            wf, pid, payload = p["workflow_id"], p["proposal_id"], json.loads(p["payload"])
+            try:
+                if p["route"] == "approval":
+                    found = next((a for a in self.client.list_approvals(wf)
+                                  if a.get("proposal_id") == pid), None)
+                    if found is None:
+                        aid, status, apply_by = self._send(wf, "approval", payload)
+                    else:
+                        aid, status, apply_by = (found.get("approval_id") or found.get("id"),
+                                                 str(found.get("status", "pending")).lower(),
+                                                 found.get("apply_by"))
+                else:
+                    if self.conn.execute("SELECT 1 FROM config_changes WHERE proposal_id=?",
+                                         (pid,)).fetchone():
+                        aid, status, apply_by = None, "auto_applied", None
+                    else:
+                        aid, status, apply_by = self._send(wf, "auto", payload)
+            except SimulatorUnavailable as e:
+                log.warning("GOVERNANCE %s still unconfirmed (%s)", pid, e)
+                continue
+            except StaleBaseVersion as e:
+                status, aid, apply_by = "stale", None, None
+                self.registry.refresh(wf)
+            except SimulatorError as e:
+                self._set_status(p, "invalid" if e.status in (400, 422) else "failed", now,
+                                 reasons={"http_status": e.status, "body": e.body})
+                changes.append((pid, "invalid" if e.status in (400, 422) else "failed"))
+                continue
+            with transaction(self.conn):
+                self.conn.execute("UPDATE proposals SET status=?, approval_id=?, apply_by=? "
+                                  "WHERE proposal_id=?", (status, aid, apply_by, pid))
+                self.audit(wf, "proposal_confirmed", pid, {"status": status, "approval_id": aid},
+                           now)
+            log.warning("GOVERNANCE %s confirmed after lost reply: %s (approval %s)",
+                        pid, status, aid)
+            changes.append((pid, status))
+            if status == "auto_applied":
+                self.registry.refresh(wf)
+                row = self.conn.execute("SELECT * FROM proposals WHERE proposal_id=?",
+                                        (pid,)).fetchone()
+                self._on_applied(row, self.registry.current_version(wf), now)
+        return changes
 
     def _defer(self, wf: str, now: str, why: str, chosen: list[Intent]) -> None:
         key = f"gov_deferred:{wf}"
