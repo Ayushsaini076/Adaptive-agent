@@ -140,6 +140,86 @@ def first_exposures(conn: sqlite3.Connection, workflow_id: str, cohort_id: str, 
     return {arm: Rate(int(y or 0), int(n)) for arm, n, y in rows}
 
 
+# Carryover unit (option b): for welcome_message / voice the variant is heard only
+# once a call connects, so it can affect pickup only on LATER dials. Unit = a
+# person whose first connected call in the window was in an arm; outcome =
+# whether their NEXT dial (same window, eligible versions) connected.
+CARRYOVER, FIRST_EXPOSURE = "carryover_next_dial", "first_exposure"
+
+
+def guardrail_unit(guardrail_kpi: Kpi, dim: str) -> str:
+    return CARRYOVER if guardrail_kpi == "pickup" and dim in POST_CONNECT_DIMS else FIRST_EXPOSURE
+
+
+def _carryover_sql(dim_expr: str, extra: str) -> str:
+    return f"""
+        WITH fc AS (
+            SELECT p, eid, arm FROM (
+                SELECT COALESCE(person_id, lead_id) AS p, event_id AS eid, {dim_expr} AS arm,
+                       ROW_NUMBER() OVER (PARTITION BY COALESCE(person_id, lead_id)
+                                          ORDER BY event_id) AS rn
+                FROM calls
+                WHERE workflow_id = ? AND cohort_id = ? AND ts >= ? AND ts < ?
+                  AND connected = 1 {extra})
+            WHERE rn = 1),
+        nxt AS (
+            SELECT fc.arm,
+                   (SELECT c.connected FROM calls c
+                    WHERE c.workflow_id = ? AND COALESCE(c.person_id, c.lead_id) = fc.p
+                      AND c.event_id > fc.eid AND c.ts < ? {extra.replace("config_version", "c.config_version")}
+                    ORDER BY c.event_id LIMIT 1) AS y
+            FROM fc)
+        SELECT arm, COUNT(y), SUM(y) FROM nxt WHERE y IS NOT NULL GROUP BY arm"""
+
+
+def carryover_exposures(conn: sqlite3.Connection, workflow_id: str, cohort_id: str, dim: str,
+                        *, versions: list[int], start: str,
+                        end: str | None = None) -> dict[str, Rate]:
+    """Per arm: pickup of the next dial after each person's first connected call."""
+    if dim not in alloc.ALLOCATION_DIMS:
+        raise ValueError(f"not an allocation dimension: {dim!r}")
+    if not versions:
+        return {}
+    qs = ",".join("?" * len(versions))
+    end = end or "9999"
+    sql = _carryover_sql(dim, f"AND config_version IN ({qs})")
+    rows = conn.execute(sql, (workflow_id, cohort_id, start, end, *versions,
+                              workflow_id, end, *versions)).fetchall()
+    return {arm: Rate(int(y or 0), int(n)) for arm, n, y in rows if arm is not None}
+
+
+def carryover_baseline(conn: sqlite3.Connection, workflow_id: str, cohort_id: str,
+                       end: str) -> Rate:
+    rows = conn.execute(_carryover_sql("'all'", ""),
+                        (workflow_id, cohort_id, "0000", end, workflow_id, end)).fetchall()
+    return Rate(int(rows[0][2] or 0), int(rows[0][1])) if rows else Rate(0, 0)
+
+
+def carryover_curve(conn: sqlite3.Connection, workflow_id: str, cohort_id: str,
+                    end: str) -> list[int]:
+    """Cumulative carryover units in the first 1..D days of history."""
+    first = conn.execute("SELECT MIN(ts) FROM calls WHERE workflow_id=? AND cohort_id=? AND "
+                         "ts < ?", (workflow_id, cohort_id, end)).fetchone()[0]
+    if first is None:
+        return []
+    day0 = _dt(first).replace(hour=0, minute=0, second=0, microsecond=0)
+    days = math.ceil((_dt(end) - day0).total_seconds() / 86400)
+    curve = []
+    for d in range(1, days + 1):
+        upto = min(day0 + timedelta(days=d), _dt(end)).isoformat(timespec="seconds")
+        rows = conn.execute(_carryover_sql("'all'", ""),
+                            (workflow_id, cohort_id, first, upto, workflow_id, upto)).fetchall()
+        curve.append(int(rows[0][1]) if rows else 0)
+    return curve
+
+
+def guardrail_exposures(conn: sqlite3.Connection, workflow_id: str, cohort_id: str, dim: str,
+                        guardrail_kpi: Kpi, unit: str, **kw) -> dict[str, Rate]:
+    if unit == CARRYOVER:
+        return carryover_exposures(conn, workflow_id, cohort_id, dim, **kw)
+    return first_exposures(conn, workflow_id, cohort_id, dim, guardrail_kpi, **kw)
+
+
 def unit_curve(conn: sqlite3.Connection, workflow_id: str, cohort_id: str, kpi: Kpi,
                end: str) -> list[int]:
     """Cumulative distinct test units seen in the first 1, 2, ... D days of history.
@@ -384,7 +464,15 @@ def plan(conn: sqlite3.Connection, registry: WorkflowRegistry, workflow_id: str,
             if not base.value or base.value >= 1:
                 reasons.append(f"{dim}/{cohort}: no usable first-exposure {kpi} baseline")
                 continue
-            n_guard, g_base, g_curve = _guardrail_sizing(conn, wf, cohort, hist_end, policy)
+            g_unit = guardrail_unit(guard, dim)
+            n_guard, g_base, g_curve = _guardrail_sizing(conn, wf, cohort, hist_end, policy,
+                                                         g_unit)
+            if n_guard < 0:
+                unit_txt = (" (unit: next dial after a connected exposure)"
+                            if g_unit == CARRYOVER else "")
+                reasons.append(f"{dim}/{cohort}: guardrail {guard}{unit_txt} has a tolerance "
+                               f"but no history observations; cannot size non-inferiority")
+                continue
             g_window = units_within(g_curve, max_days, new_only=new_only) if n_guard else 0
             for k in range(min(policy.max_candidates, len(untested)), 0, -1):
                 arms_n = k + 1
@@ -393,8 +481,10 @@ def plan(conn: sqlite3.Connection, registry: WorkflowRegistry, workflow_id: str,
                 where = (f"{dim}/{cohort}/k={k}: horizon {horizon:.0f}h ({horizon_src}), "
                          f"window gives {per_arm} {kpi} units/arm")
                 if n_guard and g_per_arm < n_guard:
-                    reasons.append(f"{where}; guardrail {guard} non-inferiority needs "
-                                   f"{n_guard}/arm, window gives {g_per_arm}/arm")
+                    unit_txt = (" (unit: next dial after a connected exposure)"
+                                if g_unit == CARRYOVER else "")
+                    reasons.append(f"{where}; guardrail {guard}{unit_txt} non-inferiority "
+                                   f"needs {n_guard}/arm, window gives {g_per_arm}/arm")
                     continue
                 mde = design_mde(base.value, per_arm, policy, k)
                 if mde is None:
@@ -440,6 +530,7 @@ def plan(conn: sqlite3.Connection, registry: WorkflowRegistry, workflow_id: str,
                                    "power": policy.power, "n_primary": n_primary,
                                    "n_guardrail": n_guard, "guardrail_baseline": g_base,
                                    "guardrail_window_units": g_window,
+                                   "guardrail_unit": g_unit,
                                    "n_per_arm": n_primary},
                         "horizon_hours": round(horizon, 1), "horizon_source": horizon_src,
                         "expected_hours": round(expected_hours, 1), "ramp_hours": ramp,
@@ -461,7 +552,8 @@ def _safe(conn: sqlite3.Connection, wf: Workflow, cfg: dict) -> dict:
 
 
 def _guardrail_sizing(conn: sqlite3.Connection, wf: Workflow, cohort: str, hist_end: str,
-                      policy: ExperimentPolicy) -> tuple[int, dict | None, list[int]]:
+                      policy: ExperimentPolicy, unit: str = FIRST_EXPOSURE
+                      ) -> tuple[int, dict | None, list[int]]:
     """(guardrail units needed per arm, baseline evidence, guardrail unit curve).
 
     0 units when the workflow states no tolerance (then the guardrail check is
@@ -470,16 +562,18 @@ def _guardrail_sizing(conn: sqlite3.Connection, wf: Workflow, cohort: str, hist_
     obj = wf.objective
     if obj.guardrail_max_drop is None:
         return 0, None, []
-    g_base = first_exposure_baseline(conn, wf.workflow_id, cohort, obj.guardrail, hist_end)
+    g_base = (carryover_baseline(conn, wf.workflow_id, cohort, hist_end) if unit == CARRYOVER
+              else first_exposure_baseline(conn, wf.workflow_id, cohort, obj.guardrail, hist_end))
     if g_base.value is None:
-        return 0, None, []
+        return -1, {"unit": unit}, []    # tolerance stated but nothing to size it from
     margin = obj.guardrail_max_drop * (g_base.value if obj.guardrail_relative else 1.0)
     if margin <= 0:
         return 0, None, []
     n = noninferiority_sample_size(g_base.value, margin, alpha=policy.alpha,
                                    power=policy.power)
-    curve = unit_curve(conn, wf.workflow_id, cohort, obj.guardrail, hist_end)
-    return n, {**g_base.as_dict(), "margin": round(margin, 4)}, curve
+    curve = (carryover_curve(conn, wf.workflow_id, cohort, hist_end) if unit == CARRYOVER
+             else unit_curve(conn, wf.workflow_id, cohort, obj.guardrail, hist_end))
+    return n, {**g_base.as_dict(), "margin": round(margin, 4), "unit": unit}, curve
 
 
 # ----------------------------------------------------------------- evaluation
@@ -603,8 +697,9 @@ def promotion_harm(conn: sqlite3.Connection, registry: WorkflowRegistry, exp: sq
     args = (conn, wf, cohort, dim)
     primary = first_exposures(*args, exp["primary_kpi"], versions=versions,
                               start=exp["promoted_ts"])
-    guard = first_exposures(*args, exp["guardrail_kpi"], versions=versions,
-                            start=exp["promoted_ts"])
+    unit = json.loads(exp["design"]).get("sizing", {}).get("guardrail_unit", FIRST_EXPOSURE)
+    guard = guardrail_exposures(*args, exp["guardrail_kpi"], unit, versions=versions,
+                                start=exp["promoted_ts"])
     empty = Rate(0, 0)
     if min(primary.get(winner, empty).den, primary.get(control, empty).den) < min_n:
         return None
@@ -793,7 +888,9 @@ class ExperimentManager:
         args = (self.conn, exp["workflow_id"], exp["cohort_id"], exp["dimension"])
         primary = first_exposures(*args, exp["primary_kpi"], versions=versions,
                                   start=exp["start_ts"])
-        guardrail = first_exposures(*args, exp["guardrail_kpi"], versions=versions,
+        unit = json.loads(exp["design"]).get("sizing", {}).get("guardrail_unit",
+                                                               FIRST_EXPOSURE)
+        guardrail = guardrail_exposures(*args, exp["guardrail_kpi"], unit, versions=versions,
                                     start=exp["start_ts"])
         candidates = json.loads(exp["candidates"])
         arms = [exp["control"], *candidates]

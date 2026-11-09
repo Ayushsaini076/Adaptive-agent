@@ -108,6 +108,12 @@ class FakeSimulator:
     # Optional generator replacing the default activity: (sim, first_minute,
     # last_minute) -> events. Lets a test dial with whatever config is LIVE.
     activity: Callable | None = None
+    # Prompt suggestion / validation service (costs credits like the real one).
+    suggestions: list[str] = field(default_factory=list)
+    validation_pass: dict[str, float] = field(default_factory=dict)
+    paid_calls: list[tuple[str, float]] = field(default_factory=list)
+    # Supervisor edits applied when simulated time reaches the given minute.
+    scheduled_edits: list[tuple[int, str, dict]] = field(default_factory=list)
 
     @property
     def finished(self) -> bool:
@@ -212,6 +218,11 @@ class FakeSimulator:
                 return httpx.Response(409, json={"detail": "finished"})
             start = self.minute
             self.minute += minutes
+            for when, wf, changes in sorted(self.scheduled_edits, key=lambda e: e[0]):
+                if start < when <= self.minute:
+                    old = self.configs[wf]
+                    self._set_config(wf, {**old, **changes}, "supervisor",
+                                     self._dims(old, {**old, **changes}))
             n = max([*self.event_chunks, *self.history_chunks], default=0) + 1
             new = [n]
             if self.activity is not None:
@@ -220,13 +231,32 @@ class FakeSimulator:
                 self.event_chunks[n] = chunk_of_activity(self.next_event_id, f"camp{n}")
                 self.next_event_id += 100
             self._decide_approvals()
-            if self.pending_events:
-                self.event_chunks[n] = self.event_chunks[n] + self.pending_events
+            if self.pending_events:          # keep event ids increasing within the chunk
+                self.event_chunks[n] = sorted(self.event_chunks[n] + self.pending_events,
+                                              key=lambda e: e["event_id"])
                 self.pending_events = []
             body = {"new_chunks": new, "finished": self.finished}
             if self.advance_has_clock:
                 body |= {"sim_minute": self.minute, "ts": self._sim_time()}
             return httpx.Response(200, json=body)
+        if (m, path) == ("POST", "/llm/suggest-fixes"):
+            if self.credits < 3:
+                return httpx.Response(402, json={"detail": "insufficient_credits"})
+            self.credits -= 3
+            self.paid_calls.append(("suggest", 3))
+            return httpx.Response(200, json={"suggestions": [
+                {"prompt_version": pv, "summary": f"candidate {pv}"} for pv in self.suggestions]})
+        if (m, path) == ("POST", "/validation/runs"):
+            body = json.loads(request.content)
+            cost = -(-int(body["n"]) // 100)
+            if self.credits < cost:
+                return httpx.Response(402, json={"detail": "insufficient_credits"})
+            self.credits -= cost
+            self.paid_calls.append(("validate:" + body["prompt_version"], cost))
+            return httpx.Response(200, json={
+                "validation_run_id": f"val_{len(self.paid_calls)}",
+                "pass_rate": self.validation_pass.get(body["prompt_version"], 0.95),
+                "n": body["n"]})
         if (m, path) == ("POST", "/approvals"):
             body = json.loads(request.content)
             if any(a["proposal_id"] == body["proposal_id"] for a in self.approvals.values()):

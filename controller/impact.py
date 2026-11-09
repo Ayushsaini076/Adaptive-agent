@@ -43,6 +43,8 @@ def diff(current: dict, proposed: dict) -> list[dict]:
 def traffic_share_changed(current: dict, proposed: dict) -> float:
     """Upper bound on the share of dials whose variant changes: the largest TV
     shift over (cohort, dim). Conservative when cohorts differ in size."""
+    if current.get("prompt_version") != proposed.get("prompt_version"):
+        return 1.0                     # prompt_version is workflow-wide: every call changes
     return max((tv for _, _, tv in allocation_shifts(current, proposed)), default=0.0)
 
 

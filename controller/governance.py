@@ -69,7 +69,7 @@ MAX_ATTEMPTS = 3
 
 @dataclass
 class Intent:
-    kind: str                     # incident_mitigation | rollback | promotion | experiment_golive
+    kind: str  # incident_mitigation | prompt_fix | rollback | promotion | experiment_golive
     ref: str                      # incident / experiment id
     workflow_id: str
     priority: int                 # lower = more important
@@ -237,6 +237,11 @@ class GovernanceManager:
             return                                   # expired/lapsed: re-proposed later
         store = ex.ExperimentStore(self.conn)
         for it in self._intents_of(p):
+            if it["kind"] == "prompt_fix":
+                with transaction(self.conn):
+                    self._escalate_incident(it["ref"], now, "prompt fix rejected by approver")
+                log.warning("GOVERNANCE prompt fix for %s rejected by approver; incident "
+                            "escalated to a human", it["ref"])
             if it["kind"] == "experiment_golive":
                 exp = store.get(it["ref"])
                 if exp is not None and exp["status"] == ex.PLANNED:
@@ -248,7 +253,8 @@ class GovernanceManager:
     # ---------------------------------------------------------------- intents
 
     def intents(self, wf: str, now: str) -> list[Intent]:
-        out = [*self._incident_intents(wf), *self._experiment_intents(wf)]
+        out = [*self._incident_intents(wf), *self._prompt_intents(wf),
+               *self._experiment_intents(wf)]
         # Exclude intents whose attempts are used up or that were rejected.
         keep = []
         for it in out:
@@ -286,6 +292,39 @@ class GovernanceManager:
                 f"(z={ev.get('z')}, drop {ev.get('relative_drop')}) sustained since "
                 f"{ev.get('breach_since')}; incident {inc['incident_id']}",
                 drop_pp, 0.9, {"incident": inc["incident_id"], "window": ev}))
+        return out
+
+    def _prompt_intents(self, wf: str) -> list[Intent]:
+        from controller import prompt_incidents as pi
+        out = []
+        for inc in self.conn.execute(
+                "SELECT * FROM incidents WHERE workflow_id=? AND kind=? AND status=?",
+                (wf, pi.KIND, pi.FIX_PROPOSED)).fetchall():
+            mit, ev = json.loads(inc["mitigation"]), json.loads(inc["evidence"])
+            chosen = mit["chosen"]
+            current = (self.registry.config(wf) or {}).get("prompt_version")
+            sup = self.conn.execute(
+                "SELECT ts FROM config_changes WHERE workflow_id=? AND actor='supervisor' AND "
+                "new_version<=? AND changed_dims LIKE '%prompt_version%' ORDER BY event_id DESC "
+                "LIMIT 1", (wf, self.registry.current_version(wf))).fetchone()
+            note = (f" Replaces prompt {current} set by a SUPERVISOR at {sup[0]}; this needs "
+                    f"your explicit approval and will not be applied otherwise." if sup else "")
+            out.append(Intent(
+                "prompt_fix", inc["incident_id"], wf, 0, inc["detected_ts"],
+                [("*", "prompt_version")],
+                lambda cfg, pv=chosen["prompt_version"]: {**cfg, "prompt_version": pv},
+                f"Change prompt_version {current} -> {chosen['prompt_version']} "
+                f"(hallucination incident)",
+                f"Hallucination flag rate {ev['window']['rate']} vs history "
+                f"{ev['baseline']['rate']} (+{100 * ev['abs_increase']:.1f}pp, z={ev['z']}). "
+                f"{chosen['prompt_version']} passed validation run {chosen['validation_run_id']} "
+                f"at {chosen['pass_rate']} (n={chosen['n']}, 95% lower bound "
+                f"{chosen['lower_bound']}); engagement will be verified after apply.{note}",
+                100 * ev["abs_increase"], 0.9,
+                {"incident": inc["incident_id"],
+                 "validation": {k: chosen[k] for k in ("validation_run_id", "pass_rate", "n",
+                                                       "lower_bound", "prompt_version")},
+                 "window": ev}))
         return out
 
     def _experiment_intents(self, wf: str) -> list[Intent]:
@@ -341,10 +380,11 @@ class GovernanceManager:
             "SELECT event_id, ts, new_version, changed_dims FROM config_changes "
             "WHERE workflow_id=? AND actor='supervisor' AND ts > ?", (wf, it.since)).fetchall()
         dims = {d for _, d in it.targets}
+        extra = {"allocations", "cohorts"} if dims & set(alloc.ALLOCATION_DIMS) else set()
         hit = []
         for r in rows:
             changed = set(json.loads(r["changed_dims"] or "[]"))
-            if changed & (dims | {"allocations", "cohorts"}):
+            if changed & (dims | extra):
                 hit.append(dict(r))
         return hit
 
@@ -355,14 +395,20 @@ class GovernanceManager:
         with transaction(self.conn):
             set_state(self.conn, key, now)
             self.audit(wf, "intent_escalated", it.ref, {"kind": it.kind, "reason": why}, now)
-            if it.kind == "incident_mitigation":
-                self.conn.execute("UPDATE incidents SET status=? WHERE incident_id=? AND status=?",
-                                  (ESCALATED, it.ref, DETECTED))
-                self.conn.execute(
-                    "INSERT INTO incident_log(incident_id, sim_ts, from_status, to_status, "
-                    "detail) VALUES (?,?,?,?,?)",
-                    (it.ref, now, DETECTED, ESCALATED, json.dumps({"reason": why})))
+            if it.kind in ("incident_mitigation", "prompt_fix"):
+                self._escalate_incident(it.ref, now, why)
         log.warning("GOVERNANCE escalate %s %s: %s; needs a human decision", it.kind, it.ref, why)
+
+    def _escalate_incident(self, inc_id: str, now: str, why: str) -> None:
+        """Caller owns the transaction."""
+        row = self.conn.execute("SELECT status FROM incidents WHERE incident_id=?",
+                                (inc_id,)).fetchone()
+        if row is None or row[0] in ("mitigated", "resolved", ESCALATED):
+            return
+        self.conn.execute("UPDATE incidents SET status=? WHERE incident_id=?", (ESCALATED, inc_id))
+        self.conn.execute("INSERT INTO incident_log(incident_id, sim_ts, from_status, to_status, "
+                          "detail) VALUES (?,?,?,?,?)",
+                          (inc_id, now, row[0], ESCALATED, json.dumps({"reason": why})))
 
     # ---------------------------------------------------------------- propose
 
@@ -405,7 +451,11 @@ class GovernanceManager:
         dims = impact.changed_dims(current, proposed)
         if not dims:
             return None
-        problems = self.validate(wf, current, proposed, dims, policy)
+        evidence = {}
+        for it in chosen:
+            if "validation" in it.evidence:
+                evidence["validation"] = it.evidence["validation"]
+        problems = self.validate(wf, current, proposed, dims, policy, evidence)
         if problems:
             self._defer(wf, now, "invalid proposal: " + "; ".join(problems), chosen)
             return None
@@ -491,7 +541,11 @@ class GovernanceManager:
             },
             "impact_score": score,
             "rationale": " | ".join(i.rationale for i in chosen),
-            "evidence": {"intents": [i.ref for i in chosen]},
+            "evidence": {"intents": [i.ref for i in chosen],
+                         **({"validation_run_id": v["validation_run_id"],
+                             "validation_pass_rate": v["pass_rate"], "validation_n": v["n"]}
+                            if (v := next((i.evidence["validation"] for i in chosen
+                                           if "validation" in i.evidence), None)) else {})},
             "expires_in_hours": policy.proposal_ttl_hours,
         }
 

@@ -346,6 +346,35 @@ class SimulatorClient:
     def put_config(self, workflow_id: str, body: JSON) -> JSON:
         return self._send("PUT", f"/workflows/{workflow_id}/config", body)
 
+    # -- prompt suggestions / validation (cost credits; never retried) ----------
+
+    def suggest_fixes(self, workflow_id: str, problem: str) -> list[JSON]:
+        """Up to three candidate prompt versions. Costs credits."""
+        payload = self._send("POST", "/llm/suggest-fixes",
+                             {"workflow_id": workflow_id, "problem": problem})
+        if isinstance(payload, dict):
+            payload = _first(payload, "suggestions", "candidates", "fixes", "items", default=[])
+        out = []
+        for item in payload or []:
+            if isinstance(item, str):
+                item = {"prompt_version": item}
+            pv = item.get("prompt_version") or item.get("version") or item.get("prompt")
+            if pv:
+                out.append({**item, "prompt_version": str(pv)})
+        return out
+
+    def run_validation(self, workflow_id: str, prompt_version: str, n: int) -> JSON:
+        """Synthetic-conversation safety validation (n in 50..2000). Costs ceil(n/100)."""
+        if not 50 <= n <= 2000:
+            raise ValueError("validation n must be between 50 and 2000")
+        raw = self._send("POST", "/validation/runs", {"workflow_id": workflow_id,
+                                                       "prompt_version": prompt_version, "n": n})
+        rid = raw.get("validation_run_id") or raw.get("run_id") or raw.get("id")
+        rate = _first(raw, "pass_rate", "safety_pass_rate", "rate")
+        return {**raw, "validation_run_id": rid,
+                "pass_rate": float(rate) if rate is not None else None,
+                "n": int(raw.get("n", n))}
+
     # -- time -------------------------------------------------------------------
 
     def advance(self, minutes: int) -> AdvanceResult:

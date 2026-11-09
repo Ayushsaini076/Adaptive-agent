@@ -11,7 +11,7 @@ An outcome-first controller for a simulated outbound voice-agent platform. It ta
 | 3. Features, cohorts, KPI aggregation | **Done** |
 | 4. First controlled experiment | **Done**: design, exposure counting and decision; go-live waits for M5 |
 | 5. Governance and audit | **Done**: approval/auto-apply lifecycle, audit query; tested on the fake |
-| 6. Incidents, decay, rollback | Partial: caller-ID health and post-promotion rollback done; prompt incidents (C8) next |
+| 6. Incidents, decay, rollback | **Done**: caller-ID health (C5), post-promotion harm check and rollback (C7), prompt incidents (C8) |
 | 7 | Not started |
 
 All development and testing uses the in-repo fake simulator (`tests/fakes.py`).
@@ -69,6 +69,7 @@ controller/
   allocations.py  the only module that reads/edits config allocations and options
   experiments.py  experiment planning, first-exposure counts, decision, lifecycle
   incidents.py    caller-ID health (C5): detection, incident record, mitigation proposal
+  prompt_incidents.py  hallucination incidents (C8): detection, credits, validation, verification
   policy.py       per-workflow governance policy from metadata + operator preferences
   impact.py       proposal evidence: diff, affected leads, dry run, impact score
   governance.py   the ONLY path that changes a config: approvals, auto-apply, apply, reconcile
@@ -136,7 +137,7 @@ The controller plans one experiment per workflow at a time, detects when its all
 | **Test** | Pooled two-proportion z-test, two-sided, with a Newcombe 95% interval on the difference. |
 | **Multiple comparisons** | Holm-Bonferroni across all planned candidates. Under-exposed candidates stay in the family with p = 1. |
 | **Practical significance** | The uplift must be at least `min_practical_uplift` (default 1pp), as well as Holm-significant. |
-| **Guardrail** | Non-inferiority on the 95% CI of (candidate − control). **Pass** if the lower bound ≥ −tolerance. **Breach** if the upper bound < −tolerance. Otherwise **unverified**, which is never promoted and never reported as a breach. The tolerance comes from the workflow objective (absolute, or relative to the control rate). With no stated tolerance, only a significant drop counts as a breach. |
+| **Guardrail** | Non-inferiority on the 95% CI of (candidate − control). **Pass** if the lower bound ≥ −tolerance, **breach** if the upper bound < −tolerance, otherwise **unverified** (never promoted, never reported as a breach). The tolerance comes from the workflow objective (absolute pp unless the key says relative). **Unit:** for a *pickup* guardrail on a post-connect setting (`welcome_message`, `voice`), first-dial pickup cannot differ between arms, so the guardrail uses the **carryover unit**: each person's first connected call in the window assigns their arm, and the outcome is whether their *next* dial connected. Otherwise each person's first exposure. A stated tolerance with no history for its unit makes the design infeasible: it is refused, never skipped. |
 | **Choosing among winners** | The highest lower confidence bound, not the highest raw rate. Ties go to declared option order. |
 | **Outcomes** | `winner`, `no_winner`, `guardrail_breach`, `guardrail_unverified`, `inconclusive` (control or all candidates under-exposed at the deadline). |
 | **Promotion** | A recommendation only. The winner gets 90% and control keeps a 10% holdout, so decay can still be measured (C7). Applying it is Milestone 5. |
@@ -202,3 +203,35 @@ One bad call, a small sample, a single bad hour or a mild dip never triggers it.
 ```
 
 For each config version it shows who changed it, the proposal and approval, the evidence and rationale, every governance step, and observational KPIs for 24h before and after (pickup and engagement with their own denominators, plus pickup per caller ID).
+
+## Prompt / hallucination incidents (C8)
+
+`controller/prompt_incidents.py` handles the full lifecycle:
+
+`detected` → `fix_proposed` → `fix_applied` → `resolved`, with three exits:
+
+- `fix_failed` → next attempt, up to 2, then `escalated`. It never goes back to the hallucinating prompt.
+- `no_safe_fix`: nothing passed validation, or the credit reserve would be breached. This escalates to a human.
+- `superseded`: a supervisor changed the prompt after detection. The controller doesn't override it and keeps monitoring.
+
+**Detection.** The hallucination-flag rate on connected, QA'd calls in the last 12 hours with QA data is compared with the workflow's own history rate. The history rate already contains the detector's false positives, and false negatives only shrink the observed rise. An incident needs **all** of:
+
+- at least 300 QA'd calls in the window;
+- z ≥ 4;
+- a rise of at least 2 points and at least 50%;
+- **each of the last 3 hours on its own** at least 2 points above history.
+
+The last rule is there because one terrible hour inflates a 12-hour window for 12 hours. While a `no_safe_fix` or `escalated` incident exists for the prompt that is still live, nothing reopens and no credits are re-spent.
+
+**Credits.** Credits are spent only when the incident is confirmed, no fix is in flight, no supervisor changed the prompt since detection, and the spend leaves a reserve of max(10, 20% of the starting credits). One attempt costs at most 9 credits: suggestions (3) plus up to 2 validations at n = 300 (3 each). Every spend goes to `credit_ledger` and a `CREDITS` log line. A 402 escalates the incident instead of crashing.
+
+**Choosing a fix.** Suggestions not in the workflow's prompt `options`, already tried, or equal to the prompt at detection are skipped. A candidate must reach `min_validation_pass_rate`; among those that do, the highest 95% lower bound wins. A validated runner-up is kept for a second attempt, so the second attempt may cost no credits at all.
+
+**Approval.** The fix always goes through governance (`prompt_version` isn't auto-apply eligible), with `evidence.validation_run_id` and the pass rate attached. If it replaces a prompt a supervisor set, the rationale says so explicitly and needs approval.
+
+**Verification after apply.** Both are required:
+
+- the hallucination rise is now below 2 points **and** the upper bound is clearly below the incident window;
+- engagement is not significantly below the history baseline by more than the tolerance (z ≤ −3), where the tolerance is the objective's engagement guardrail or 2 points.
+
+A safer prompt that makes people hang up is a failed fix.

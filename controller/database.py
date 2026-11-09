@@ -339,6 +339,22 @@ MIGRATIONS: list[Migration] = [
     CREATE INDEX idx_audit_wf ON audit_log(workflow_id, id);
     CREATE INDEX idx_audit_ref ON audit_log(ref, id);
     """,
+    # 6: credit ledger (prompt suggestions / validation runs)
+    """
+    CREATE TABLE credit_ledger (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        sim_ts        TEXT,
+        workflow_id   TEXT,
+        incident_id   TEXT,
+        action        TEXT NOT NULL,        -- suggest_fixes | validation_run
+        cost          REAL NOT NULL,
+        credits_before REAL,
+        credits_after  REAL,
+        detail        TEXT NOT NULL,        -- JSON: request + response ids/results
+        logged_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_credit_ledger_inc ON credit_ledger(incident_id);
+    """,
 ]
 
 

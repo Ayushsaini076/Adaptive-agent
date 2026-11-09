@@ -553,3 +553,80 @@ def test_proposed_config_never_dials_caller_id_with_open_incident(w):
     w.reg.refresh("wf")
     design, _ = plan(w.conn, w.reg, "wf", POLICY)
     assert design.proposed_config["allocations"]["default"]["caller_id"] == {"c_ok": 1.0}
+
+
+# ------------------------------------------------------------------ option (b): carryover guardrail
+
+from controller.experiments import (  # noqa: E402
+    CARRYOVER,
+    FIRST_EXPOSURE,
+    carryover_baseline,
+    carryover_exposures,
+    guardrail_unit,
+)
+
+
+def test_guardrail_unit_choice():
+    assert guardrail_unit("pickup", "welcome_message") == CARRYOVER
+    assert guardrail_unit("pickup", "voice") == CARRYOVER
+    assert guardrail_unit("pickup", "caller_id") == FIRST_EXPOSURE      # acts before connect
+    assert guardrail_unit("engagement", "voice") == FIRST_EXPOSURE
+
+
+def _call(eid, person, hour, voice, connected, version=2, day=4):
+    return make_call(eid, person, f"2027-01-{day:02d}T{hour:02d}:00:00+05:30", voice,
+                     connected, version=version)
+
+
+def test_carryover_counts_next_dial_after_first_connected_exposure(w):
+    w.ingest([
+        _call(60_001, "a", 9, "v1", False),          # before exposure: ignored
+        _call(60_002, "a", 10, "v2", True),          # a exposed to v2
+        _call(60_003, "a", 11, "v1", True),          # a's next dial connected -> v2: 1/1
+        _call(60_004, "b", 10, "v1", True),          # b exposed to v1
+        _call(60_005, "b", 12, "v2", False),         # next dial not connected -> v1: 0/1
+        _call(60_006, "c", 10, "v1", True),          # c never re-dialled: no observation
+        _call(60_007, "d", 10, "v2", False),         # d never connected: no exposure
+        _call(60_008, "e", 10, "v2", True),          # e exposed to v2 ...
+        _call(60_009, "e", 13, "v2", True, version=1),   # ... next dial on old config: ignored
+    ])
+    got = carryover_exposures(w.conn, "wf", "default", "voice", versions=[2],
+                              start="2027-01-04T00:00:00+05:30")
+    assert got == {"v2": Rate(1, 1), "v1": Rate(0, 1)}
+
+
+def test_carryover_baseline_from_history(w):
+    w.ingest([_call(61_001, "x", 9, "v1", True, day=3, version=1),
+              _call(61_002, "x", 12, "v1", True, day=3, version=1),
+              _call(61_003, "y", 9, "v1", True, day=3, version=1),
+              _call(61_004, "y", 12, "v1", False, day=3, version=1)])
+    # history fixture: h-persons are dialled once (no next dial); x, y add 1/2
+    assert carryover_baseline(w.conn, "wf", "default", HIST_END) == Rate(1, 2)
+
+
+def test_engagement_primary_plan_sizes_pickup_guardrail_on_carryover(tmp_path):
+    w = World(tmp_path)
+    w.sim.workflows["wf"]["objective"] = {"primary": "engagement_rate",
+                                          "guardrail": {"pickup_rate_max_drop": 0.02}}
+    w.reg.refresh("wf")
+    p = ExperimentPolicy(dimensions=("voice",), min_history_units=50)
+    design, reasons = plan(w.conn, w.reg, "wf", p)
+    assert design is None
+    # history fixture has no re-dialled people: no carryover baseline -> refuse, don't skip
+    assert any("guardrail pickup (unit: next dial after a connected exposure) has a tolerance "
+               "but no history observations" in r for r in reasons), reasons
+
+
+def test_carryover_guardrail_sized_from_history_redials(tmp_path):
+    w = World(tmp_path)
+    w.sim.workflows["wf"]["objective"] = {"primary": "engagement_rate",
+                                          "guardrail": {"pickup_rate_max_drop": 0.02}}
+    w.reg.refresh("wf")
+    redials = [_call(62_000 + i, f"h{i}", 15, "v1", i % 4 == 0, day=3, version=1)
+               for i in range(2, 201, 2)]               # connected h-persons re-dialled
+    w.ingest(redials)
+    p = ExperimentPolicy(dimensions=("voice",), min_history_units=50)
+    design, reasons = plan(w.conn, w.reg, "wf", p)
+    assert design is None                                # 2pp NI needs thousands; 100 exist
+    msg = next(r for r in reasons if "next dial after a connected exposure" in r)
+    assert "non-inferiority needs" in msg and "window gives" in msg

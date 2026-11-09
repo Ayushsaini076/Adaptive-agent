@@ -29,6 +29,7 @@ from controller.database import set_state, transaction
 from controller.experiments import ExperimentManager
 from controller.governance import GovernanceManager
 from controller.incidents import CallerIdMonitor
+from controller.prompt_incidents import HallucinationMonitor
 from controller.ingestion import EventIdCollision, Ingester, IngestStats
 from controller.metrics import snapshot_baselines
 from controller.settings import Settings
@@ -165,6 +166,7 @@ def run(settings: Settings, client: SimulatorClient, conn: sqlite3.Connection,
     snapshot_history_baselines(conn, summary.workflows)
     experiments = ExperimentManager(conn, registry)
     caller_ids = CallerIdMonitor(conn, registry)
+    prompts = HallucinationMonitor(conn, client, registry)
     governance = GovernanceManager(conn, client, registry)
     governance.log_policies()
     _tick_experiments(experiments)
@@ -207,6 +209,7 @@ def run(settings: Settings, client: SimulatorClient, conn: sqlite3.Connection,
             live.add(r)
         registry.refresh_changed()
         caller_ids.tick()            # before experiments: proposals exclude flagged IDs
+        prompts.tick()
         _tick_experiments(experiments)
         governance.tick()            # the only path that changes a config
         # Time is recorded only after its chunks are committed.
