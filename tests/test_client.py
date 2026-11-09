@@ -91,7 +91,7 @@ def test_iter_chunk_streams_ndjson_and_skips_blank_lines():
 def test_fetch_chunk(sim):
     with sim.client() as c:
         events = c.fetch_chunk(1)
-    assert [e["event_id"] for e in events] == [1, 2]
+    assert [e["event_id"] for e in events] == [1, 2, 3, 4, 5]
 
 
 def test_iter_chunk_invalid_json_raises():
@@ -115,7 +115,7 @@ def test_iter_chunk_missing_raises_not_found(sim):
 def test_advance_returns_new_chunks_and_time(sim):
     with sim.client() as c:
         r = c.advance(60)
-    assert r.new_chunks == [1]
+    assert r.new_chunks == [3]  # chunk numbers are global, after history 1-2
     assert r.sim_time == "D0 01:00"
     assert r.finished is False
     req = sim.requests[-1]

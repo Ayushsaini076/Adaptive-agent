@@ -18,6 +18,57 @@ from controller.client import SimulatorClient
 Handler = Callable[[httpx.Request], httpx.Response]
 
 
+class BrokenStream(httpx.SyncByteStream):
+    """Yields ``good_lines`` NDJSON lines, then fails like a dropped connection."""
+
+    def __init__(self, lines: list[str], good_lines: int) -> None:
+        self.lines, self.good = lines, good_lines
+
+    def __iter__(self):
+        for line in self.lines[: self.good]:
+            yield line.encode()
+        raise httpx.ReadError("connection reset mid-chunk")
+
+
+def campaign_event(eid: int, campaign: str, wf: str = "wf_a", n: int = 2) -> dict:
+    return {"event_id": eid, "type": "campaign_created", "ts": "2027-01-04T09:00:00+05:30",
+            "tenant_id": "t1", "workflow_id": wf, "campaign_id": campaign,
+            "lead_count": n, "config_version": 3}
+
+
+def lead_event(eid: int, lead: str, campaign: str, wf: str = "wf_a") -> dict:
+    return {"event_id": eid, "type": "lead", "ts": "2027-01-04T09:00:00+05:30",
+            "workflow_id": wf, "campaign_id": campaign, "lead_id": lead,
+            "person_id": "p_" + lead,
+            "features": {"lang": "hi", "city_tier": 2, "age_band": "30-45", "value_band": "mid"}}
+
+
+def call_event(eid: int, lead: str, campaign: str, wf: str = "wf_a", *,
+               connected: bool = True, engaged: bool = True, attempt: int = 1) -> dict:
+    return {"event_id": eid, "type": "call", "ts": "2027-01-04T10:00:00+05:30",
+            "tenant_id": "t1", "workflow_id": wf, "campaign_id": campaign,
+            "lead_id": lead, "person_id": "p_" + lead, "attempt": attempt,
+            "campaign_day": 0, "config_version": 3, "cohort_id": "default",
+            "variant": {"welcome_message": "w1", "voice": "v1", "caller_id": "c1",
+                        "prompt_version": "p1"},
+            "connected": connected, "engaged": engaged and connected,
+            "disposition": "concluded_interested" if engaged else "no_answer",
+            "duration_s": 42.0, "turns": 6,
+            "qa": {"hallucination_flag": False, "flow_adherence": 0.9} if connected else None}
+
+
+def chunk_of_activity(first_eid: int, campaign: str, n_leads: int = 2) -> list[dict]:
+    """campaign_created, n leads, one call per lead; event_ids consecutive."""
+    out = [campaign_event(first_eid, campaign, n=n_leads)]
+    eid = first_eid + 1
+    for i in range(n_leads):
+        out.append(lead_event(eid, f"{campaign}_L{i}", campaign)); eid += 1
+    for i in range(n_leads):
+        out.append(call_event(eid, f"{campaign}_L{i}", campaign, connected=i % 2 == 0))
+        eid += 1
+    return out
+
+
 @dataclass
 class FakeSimulator:
     workflows: dict[str, dict] = field(default_factory=dict)
@@ -30,6 +81,9 @@ class FakeSimulator:
     requests: list[httpx.Request] = field(default_factory=list)
     # path -> list of responses to return before normal handling (fault injection)
     faults: dict[str, list[httpx.Response]] = field(default_factory=dict)
+    # chunk_number -> number of lines to serve before the stream breaks (one-shot)
+    broken_chunks: dict[int, int] = field(default_factory=dict)
+    next_event_id: int = 1000
 
     @property
     def finished(self) -> bool:
@@ -59,9 +113,10 @@ class FakeSimulator:
             if self.finished:
                 return httpx.Response(409, json={"detail": "finished"})
             self.minute += minutes
-            start = max(self.event_chunks, default=0) + 1
-            new = [start]
-            self.event_chunks[start] = [{"event_id": start * 10, "type": "call"}]
+            n = max([*self.event_chunks, *self.history_chunks], default=0) + 1
+            new = [n]
+            self.event_chunks[n] = chunk_of_activity(self.next_event_id, f"camp{n}")
+            self.next_event_id += 100
             return httpx.Response(200, json={"new_chunks": new, "sim_time": self._sim_time(),
                                              "finished": self.finished})
         if (m, path) == ("GET", "/workflows"):
@@ -88,7 +143,10 @@ class FakeSimulator:
             events = self.history_chunks.get(n) or self.event_chunks.get(n)
             if events is None:
                 return httpx.Response(404, json={"detail": "no such chunk"})
-            body = "".join(json.dumps(e) + "\n" for e in events)
+            lines = [json.dumps(e) + "\n" for e in events]
+            if n in self.broken_chunks:
+                return httpx.Response(200, stream=BrokenStream(lines, self.broken_chunks.pop(n)))
+            body = "".join(lines)
             return httpx.Response(200, text=body,
                                   headers={"content-type": "application/x-ndjson"})
         return httpx.Response(404, json={"detail": f"no route {m} {path}"})
@@ -110,7 +168,6 @@ def sample_simulator() -> FakeSimulator:
         },
         configs={"wf_a": {"version": 3, "prompt_version": "p1"},
                  "wf_b": {"version": 1, "prompt_version": "p9"}},
-        history_chunks={1: [{"event_id": 1, "type": "campaign_created"},
-                            {"event_id": 2, "type": "lead"}],
-                        2: [{"event_id": 3, "type": "call"}]},
+        history_chunks={1: chunk_of_activity(1, "hist1"),
+                        2: chunk_of_activity(100, "hist2", n_leads=3)},
     )
