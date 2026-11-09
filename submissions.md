@@ -51,7 +51,6 @@ The implementation prioritises a reliable and auditable control loop over unrest
 | Configuration application | Included through the governed path |
 | Rollback and mitigation handling | Included in the control architecture |
 | Audit and reporting | Included |
-| SQL query agent | Deferred |
 | Unrestricted autonomous mutation | Excluded |
 | LLM-controlled configuration decisions | Excluded |
 | Real public load scenario | Completed at the tested workload |
